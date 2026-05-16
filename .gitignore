@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+node_modules/
+screenshots/*.xcf
+*.kate-swp
+.DS_Store
