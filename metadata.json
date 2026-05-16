@@ -1,0 +1,21 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "makan.midyaty@gmail.com",
+                "Name": "Makan Karwan Sulaiman"
+            }
+        ],
+        "BugReportUrl": "https://github.com/schiz0x00/kclaude/issues",
+        "Category": "System Information",
+        "Description": "Monitor Claude Code usage limits from the Plasma panel. Unofficial, not affiliated with Anthropic.",
+        "Icon": "kclaude",
+        "Id": "io.github.schiz0x00.kclaude",
+        "License": "MIT",
+        "Name": "kclaude",
+        "Version": "1.0.0",
+        "Website": "https://github.com/schiz0x00/kclaude"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "KPackageStructure": "Plasma/Applet"
+}
