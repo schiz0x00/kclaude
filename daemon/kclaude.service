@@ -1,0 +1,19 @@
+[Unit]
+Description=kclaude usage collector
+Documentation=https://github.com/schiz0x00/kclaude
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kclaude-daemon
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
+# Cheap hardening that works in a user manager without namespaces: both are
+# prctl/seccomp only, so they cannot fail to apply on an unusual distro.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+[Install]
+# graphical-session.target is only reachable when the session manager pulls it
+# in; default.target starts the collector for any user session.
+WantedBy=default.target

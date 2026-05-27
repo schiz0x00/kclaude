@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Polls the Claude account usage endpoint and writes usage.json for the plasmoid.
+
+Reads the OAuth token Claude Code stores in ~/.claude/.credentials.json, and
+writes a refreshed token back when it expires. See the Security section of the
+README: this daemon shares a credential file it does not own.
+"""
+import contextlib
+import fcntl
+import json
+import os
+import random
+import select
+import signal
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "kclaude")
+USAGE_FILE = os.path.join(STATE_DIR, "usage.json")
+LOCK_FILE = os.path.join(STATE_DIR, "daemon.lock")
+CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
+
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+# The endpoint rate-limits well below one call every 30s. The widget treats data
+# older than 15 minutes as stale, so 5 minutes leaves a 3x margin.
+DEFAULT_INTERVAL = 300
+MIN_INTERVAL = 60
+MAX_BACKOFF = 3600
+# A held-down Refresh button must not turn into an API hammer. The usage
+# endpoint returns 429 well below one call every 30s, so this is the floor for
+# manually requested polls, not a nicety.
+MIN_POLL_GAP = 30
+# Refresh the token this long before it actually expires.
+TOKEN_SKEW_MS = 5 * 60 * 1000
+
+WINDOW_KEYS = ("five_hour", "seven_day", "thirty_day")
+
+
+class AuthError(Exception):
+    """The credentials are gone or rejected: waiting will not fix it, only the
+    user re-authenticating Claude Code will. Surfaced to the widget via the
+    "error" key in usage.json, and retried gently in case they just did."""
+
+
+def write_atomic(path, text, mode=0o644):
+    """Write via temp file + rename so readers never observe a partial file."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            # chmod before the content lands, so the file is never briefly readable.
+            os.fchmod(f.fileno(), mode)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # suppress: never let cleanup replace the original traceback.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def single_instance_lock():
+    """Return a held lock fd, or None if another daemon already has it.
+
+    Two daemons refreshing concurrently both rotate the refresh token. The loser
+    then writes a server-invalidated token into ~/.claude/.credentials.json and
+    Claude Code itself has to re-authenticate. Refusing to start twice is worth
+    more than the convenience of a second instance.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd = os.open(LOCK_FILE, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    # Held for the process lifetime; closing the fd would release it.
+    return fd
+
+
+class Waker:
+    """Lets SIGUSR1 cut the poll interval short, so the widget's Refresh button
+    can force an immediate poll without restarting the daemon.
+
+    Uses set_wakeup_fd + select rather than a flag checked around time.sleep:
+    PEP 475 makes time.sleep resume after a handler returns, and touching a lock
+    from inside a handler can deadlock against the code it interrupted.
+    """
+
+    def __init__(self):
+        self._r, self._w = os.pipe()
+        os.set_blocking(self._r, False)
+        os.set_blocking(self._w, False)
+        signal.set_wakeup_fd(self._w)
+        # A Python-level handler has to exist or SIGUSR1 keeps its default
+        # action, which is to kill the process.
+        signal.signal(signal.SIGUSR1, lambda *_: None)
+
+    def wait(self, seconds):
+        """Sleep up to `seconds`. Returns True if a signal cut it short."""
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                ready, _, _ = select.select([self._r], [], [], remaining)
+            except InterruptedError:
+                continue
+            if not ready:
+                return False
+            with contextlib.suppress(BlockingIOError):
+                os.read(self._r, 4096)
+            return True
+
+
+def load_credentials():
+    with open(CREDENTIALS_FILE) as f:
+        return json.load(f)
+
+
+def save_oauth(oauth):
+    """Merge the refreshed token back, re-reading the file first.
+
+    Claude Code owns this file and updates sibling keys (mcpOAuth,
+    organizationUuid) on its own schedule. Re-reading immediately before the
+    write shrinks the lost-update window from a whole poll interval to
+    microseconds. It cannot close it -- Claude Code does not take our lock -- so
+    only the one key we actually changed is written back.
+    """
+    try:
+        creds = load_credentials()
+    except (OSError, ValueError):
+        creds = {}
+    creds["claudeAiOauth"] = oauth
+    # 0600: the file holds live OAuth tokens.
+    write_atomic(CREDENTIALS_FILE, json.dumps(creds, indent=2), mode=0o600)
+
+
+def refresh_access_token(oauth):
+    """Exchange the refresh token. The server rotates it, so persist at once."""
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": oauth["refreshToken"],
+        "client_id": CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(TOKEN_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        # 400 is what an invalid/rotated-away refresh token actually returns
+        # (invalid_grant). 5xx and network errors stay retryable errors.
+        if e.code in (400, 401, 403):
+            raise AuthError("Claude Code login expired: run 'claude' and sign in again") from e
+        raise
+    oauth["accessToken"] = data["access_token"]
+    if "refresh_token" in data:
+        oauth["refreshToken"] = data["refresh_token"]
+    if "expires_in" in data:
+        oauth["expiresAt"] = int(time.time() * 1000) + data["expires_in"] * 1000
+    save_oauth(oauth)
+    return oauth["accessToken"]
+
+
+def token_expired(oauth):
+    expires_at = oauth.get("expiresAt")
+    if not isinstance(expires_at, (int, float)):
+        return False  # unknown expiry -> let the 401 path handle it
+    return time.time() * 1000 >= expires_at - TOKEN_SKEW_MS
+
+
+def fetch_usage(access_token):
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.load(resp)
+
+
+def get_usage():
+    try:
+        oauth = load_credentials()["claudeAiOauth"]
+    except FileNotFoundError:
+        raise AuthError("No Claude Code credentials found: run 'claude' and sign in") from None
+    except (KeyError, ValueError):
+        raise AuthError("Credentials file has no Claude Code OAuth entry: run 'claude' and sign in") from None
+    # Refresh up front when the token is known-expired, instead of burning a
+    # request to discover it.
+    access_token = refresh_access_token(oauth) if token_expired(oauth) else oauth["accessToken"]
+    try:
+        return fetch_usage(access_token)
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        return fetch_usage(refresh_access_token(oauth))
+
+
+def normalize_windows(raw):
+    """API percentages (0-100) -> the widget's 0.0-1.0 model."""
+    windows = {}
+    for key in WINDOW_KEYS:
+        window = raw.get(key)
+        if not isinstance(window, dict):
+            continue
+        utilization = window.get("utilization")
+        if not isinstance(utilization, (int, float)):
+            continue
+        windows[key] = {
+            "utilization": utilization / 100.0,
+            "resetAt": window.get("resets_at"),
+        }
+    return windows
+
+
+def write_usage(raw):
+    windows = normalize_windows(raw)
+    if not windows:
+        raise ValueError(f"no usable windows in response (keys: {sorted(raw)})")
+    payload = {
+        "windows": windows,
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    write_atomic(USAGE_FILE, json.dumps(payload, indent=4))
+
+
+def write_error(message):
+    """Put an auth problem in usage.json without discarding the last good
+    numbers: the widget keeps showing them (as stale) alongside the message.
+    A successful poll rewrites the file without the key, clearing it."""
+    try:
+        with open(USAGE_FILE) as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            payload = {}
+    except (OSError, ValueError):
+        payload = {}
+    payload.setdefault("windows", {})
+    payload.setdefault("updatedAt", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    payload["error"] = message
+    write_atomic(USAGE_FILE, json.dumps(payload, indent=4))
+
+
+def retry_after(error, fallback):
+    """Honour Retry-After on 429/503 when the server supplies one."""
+    try:
+        # Capped: a bogus or hostile header must not park the daemon for a week.
+        return min(MAX_BACKOFF, max(fallback, int(error.headers.get("Retry-After"))))
+    except (AttributeError, TypeError, ValueError):
+        return fallback
+
+
+def parse_interval(argv):
+    if len(argv) <= 1:
+        return DEFAULT_INTERVAL
+    try:
+        return max(MIN_INTERVAL, int(argv[1]))
+    except ValueError:
+        raise SystemExit(f"kclaude-daemon: interval must be a whole number of seconds, got {argv[1]!r}")
+
+
+def main():
+    interval = parse_interval(sys.argv)
+    if single_instance_lock() is None:
+        # Exit 0: this is the expected outcome of starting a second copy, not a
+        # failure for systemd to restart in a loop.
+        print("kclaude-daemon: another instance is already running, exiting", file=sys.stderr)
+        return
+    waker = Waker()
+    backoff = interval
+    last_poll = 0.0
+    while True:
+        last_poll = time.monotonic()
+        try:
+            write_usage(get_usage())
+            backoff = interval
+            delay = interval
+            wake_floor = MIN_POLL_GAP
+        except AuthError as e:
+            print(f"kclaude-daemon: {e}", file=sys.stderr)
+            write_error(str(e))
+            delay = backoff
+            backoff = min(backoff * 2, MAX_BACKOFF)
+            # The user's next move is re-authenticating and hitting Refresh, so
+            # unlike the generic backoff below, let a manual poll through at the
+            # normal pace. If they have not re-authed yet it costs one token
+            # request per click, floored at MIN_POLL_GAP.
+            wake_floor = MIN_POLL_GAP
+        except Exception as e:
+            print(f"kclaude-daemon: {e}", file=sys.stderr)
+            # Exponential backoff so a rate limit or an outage is not hammered.
+            delay = retry_after(e, backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF)
+            # While backing off, a refresh request must not short-circuit the
+            # wait: that is exactly how one 429 becomes a hammer.
+            wake_floor = delay
+        # Jitter avoids lockstep retries across restarts.
+        if waker.wait(delay + random.uniform(0, min(15, delay * 0.1))):
+            # Woken by SIGUSR1 (the widget asking for a poll now). Pace it, and
+            # say so: a manual refresh that did nothing is worth being able to see.
+            since = time.monotonic() - last_poll
+            if since < wake_floor:
+                print(f"kclaude-daemon: poll requested, pacing {wake_floor - since:.0f}s",
+                      file=sys.stderr)
+                time.sleep(wake_floor - since)
+            else:
+                print("kclaude-daemon: poll requested", file=sys.stderr)
+
+
+def selftest():
+    global CREDENTIALS_FILE, STATE_DIR, LOCK_FILE
+
+    assert normalize_windows({"five_hour": {"utilization": 68, "resets_at": "T"}}) == {
+        "five_hour": {"utilization": 0.68, "resetAt": "T"}
+    }
+    # Missing, null and non-dict windows are dropped rather than written as 0%.
+    assert normalize_windows({"five_hour": {"utilization": None}, "seven_day": None}) == {}
+    assert normalize_windows({}) == {}
+    assert token_expired({"expiresAt": 0})
+    assert not token_expired({"expiresAt": (time.time() + 3600) * 1000})
+    assert not token_expired({})  # unknown expiry -> let the 401 path handle it
+
+    assert parse_interval(["x"]) == DEFAULT_INTERVAL
+    assert parse_interval(["x", "5"]) == MIN_INTERVAL  # clamped up
+    assert parse_interval(["x", "900"]) == 900
+
+    class FakeErr:
+        headers = {"Retry-After": "120"}
+    assert retry_after(FakeErr(), 60) == 120
+    assert retry_after(FakeErr(), 300) == 300  # never shorter than our backoff
+    FakeErr.headers = {"Retry-After": "999999"}
+    assert retry_after(FakeErr(), 60) == MAX_BACKOFF  # capped
+    FakeErr.headers = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+    assert retry_after(FakeErr(), 60) == 60  # HTTP-date form -> fall back
+    assert retry_after(RuntimeError("no headers"), 60) == 60
+
+    # The file format is the contract with FileUsageProvider.qml, which reads
+    # windows[*].utilization, windows[*].resetAt and updatedAt. Changing a key
+    # here silently blanks the widget, so pin the shape.
+    global USAGE_FILE
+    with tempfile.TemporaryDirectory() as d:
+        USAGE_FILE = os.path.join(d, "usage.json")
+        write_usage({
+            "five_hour": {"utilization": 68, "resets_at": "2026-07-30T18:00:00Z"},
+            "seven_day": {"utilization": 41.5, "resets_at": "2026-08-03T00:00:00Z"},
+        })
+        written = json.load(open(USAGE_FILE))
+        assert set(written) == {"windows", "updatedAt"}, written
+        assert set(written["windows"]) == {"five_hour", "seven_day"}, written
+        for w in written["windows"].values():
+            assert set(w) == {"utilization", "resetAt"}, w
+            assert 0.0 <= w["utilization"] <= 1.0, w
+        assert written["windows"]["five_hour"]["utilization"] == 0.68
+        assert written["updatedAt"].endswith("Z")
+
+        # An auth error lands in the file without clobbering the numbers...
+        write_error("re-auth me")
+        after_err = json.load(open(USAGE_FILE))
+        assert after_err["error"] == "re-auth me", after_err
+        assert set(after_err["windows"]) == {"five_hour", "seven_day"}, after_err
+        # ...and the next successful poll clears it (pinned by the exact-keys
+        # assertion above too, but say it explicitly).
+        write_usage({"five_hour": {"utilization": 10, "resets_at": "T"}})
+        assert "error" not in json.load(open(USAGE_FILE))
+        # No prior file: the error-only payload still has the contract keys.
+        USAGE_FILE = os.path.join(d, "fresh", "usage.json")
+        write_error("no creds")
+        fresh = json.load(open(USAGE_FILE))
+        assert set(fresh) == {"windows", "updatedAt", "error"}, fresh
+        assert fresh["windows"] == {}
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "sub", "usage.json")
+        write_atomic(p, '{"a":1}', mode=0o600)
+        assert json.load(open(p)) == {"a": 1}
+        assert os.stat(p).st_mode & 0o777 == 0o600
+        assert not [n for n in os.listdir(os.path.dirname(p)) if n.startswith(".tmp-")]
+
+        # save_oauth must not drop the keys Claude Code owns.
+        CREDENTIALS_FILE = os.path.join(d, ".credentials.json")
+        write_atomic(CREDENTIALS_FILE, json.dumps({
+            "claudeAiOauth": {"accessToken": "old"},
+            "mcpOAuth": {"keep": "me"},
+            "organizationUuid": "org-1",
+        }), mode=0o600)
+        save_oauth({"accessToken": "new"})
+        after = json.load(open(CREDENTIALS_FILE))
+        assert after == {
+            "claudeAiOauth": {"accessToken": "new"},
+            "mcpOAuth": {"keep": "me"},
+            "organizationUuid": "org-1",
+        }, after
+        assert os.stat(CREDENTIALS_FILE).st_mode & 0o777 == 0o600
+
+        # A missing credential file must not crash the write path.
+        CREDENTIALS_FILE = os.path.join(d, "absent.json")
+        save_oauth({"accessToken": "fresh"})
+        assert json.load(open(CREDENTIALS_FILE)) == {"claudeAiOauth": {"accessToken": "fresh"}}
+
+        # Missing or gutted credentials classify as AuthError (a state only the
+        # user can fix), not as a generic error to back off on forever.
+        CREDENTIALS_FILE = os.path.join(d, "nope.json")
+        try:
+            get_usage()
+            raise SystemExit("selftest: expected AuthError for missing credentials")
+        except AuthError:
+            pass
+        CREDENTIALS_FILE = os.path.join(d, "empty.json")
+        write_atomic(CREDENTIALS_FILE, "{}", mode=0o600)
+        try:
+            get_usage()
+            raise SystemExit("selftest: expected AuthError for missing claudeAiOauth")
+        except AuthError:
+            pass
+
+        # Second instance is refused while the first holds the lock.
+        STATE_DIR = os.path.join(d, "state")
+        LOCK_FILE = os.path.join(STATE_DIR, "daemon.lock")
+        first = single_instance_lock()
+        assert first is not None
+        assert single_instance_lock() is None
+        os.close(first)
+        second = single_instance_lock()
+        assert second is not None  # freed once the holder exits
+        os.close(second)
+
+    print("selftest ok")
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        selftest()
+    else:
+        main()
