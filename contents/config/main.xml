@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0 http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+    <kcfgfile name=""/>
+    <group name="General">
+        <entry name="compactMode" type="Int">
+            <default>2</default>
+        </entry>
+        <!-- The collector only writes every 5 minutes, so re-reading the file
+             faster than 60s just spawns processes for identical data. -->
+        <entry name="refreshInterval" type="Int">
+            <default>60</default>
+        </entry>
+        <entry name="warningThreshold" type="Int">
+            <default>75</default>
+        </entry>
+        <entry name="criticalThreshold" type="Int">
+            <default>90</default>
+        </entry>
+        <entry name="filePath" type="String">
+            <default>~/.local/state/kclaude/usage.json</default>
+        </entry>
+        <entry name="refreshOnPopup" type="Bool">
+            <default>true</default>
+        </entry>
+        <!-- Starts an already-installed collector unit when the popup opens.
+             Never installs it: that stays an explicit install.sh choice. -->
+        <entry name="autoStartCollector" type="Bool">
+            <default>true</default>
+        </entry>
+        <entry name="showTooltip" type="Bool">
+            <default>true</default>
+        </entry>
+        <entry name="showResetCountdown" type="Bool">
+            <default>true</default>
+        </entry>
+    </group>
+</kcfg>
