@@ -1,0 +1,70 @@
+# Builds the .deb and .rpm from the staged tree that scripts/build-packages.sh
+# lays out. One config for both formats; nfpm writes the rpm itself, so no
+# rpmbuild and no spec file.
+name: kclaude
+# Pure QML, Python and data files: nothing here is compiled.
+arch: all
+platform: linux
+version: ${KCLAUDE_VERSION}
+version_schema: none
+section: utils
+priority: optional
+maintainer: Makan Karwan Sulaiman <makan.midyaty@gmail.com>
+homepage: https://github.com/schiz0x00/kclaude
+license: MIT
+description: |
+  Plasma 6 panel widget for Claude Code usage limits.
+  Shows the five-hour, weekly and monthly windows with a colour-coded status
+  dot, plus an optional systemd user service that collects the numbers.
+  Unofficial: not affiliated with, endorsed by or sponsored by Anthropic.
+
+# Plasma 6 itself is packaged under a different name on every distro
+# (plasma-workspace on Debian, plasma-desktop/plasma-workspace on Fedora and
+# openSUSE), so it stays out of depends: a wrong name is a hard install failure,
+# while a missing one only means the widget has nowhere to load. python3 is the
+# collector's only real dependency and is named the same everywhere.
+depends:
+  - python3
+
+contents:
+  - src: build/stage/plasmoid
+    dst: /usr/share/plasma/plasmoids/io.github.schiz0x00.kclaude
+    file_info:
+      mode: 0644
+  - src: build/stage/kclaude-daemon
+    dst: /usr/bin/kclaude-daemon
+    file_info:
+      mode: 0755
+  - src: build/stage/kclaude.service
+    dst: /usr/lib/systemd/user/kclaude.service
+    file_info:
+      mode: 0644
+  # The "Add Widgets" browser resolves metadata.json's Icon by name, not path.
+  - src: contents/icons/claude.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/kclaude.svg
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/kclaude/README.md
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/licenses/kclaude/LICENSE
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: LICENSE
+    dst: /usr/share/doc/kclaude/copyright
+    file_info:
+      mode: 0644
+    packager: deb
+
+scripts:
+  postinstall: packaging/postinstall.sh
+
+deb:
+  fields:
+    Bug-Database: https://github.com/schiz0x00/kclaude/issues
+
+rpm:
+  group: Applications/System
