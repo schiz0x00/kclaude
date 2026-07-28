@@ -1,0 +1,73 @@
+# Builds the installable .deb and .rpm. Runs on every push so a broken package
+# layout shows up immediately, and attaches them to the GitHub release when a
+# v* tag is pushed.
+name: Packages
+
+on:
+  push:
+    tags: ['v*']
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed by the release step below; harmless on ordinary pushes.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      # No pinned release asset URL: nfpm's .deb filename contains its version,
+      # so `go install` is the one form that does not need updating.
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build packages
+        run: ./scripts/build-packages.sh
+
+      # The package is only useful if Plasma can find the applet and systemd can
+      # find the collector, and a staging mistake is invisible otherwise.
+      - name: Verify package layout
+        run: |
+          set -euo pipefail
+          contents=$(dpkg-deb -c dist/*.deb)
+          for expected in \
+              ./usr/share/plasma/plasmoids/io.github.schiz0x00.kclaude/metadata.json \
+              ./usr/share/plasma/plasmoids/io.github.schiz0x00.kclaude/contents/ui/main.qml \
+              ./usr/bin/kclaude-daemon \
+              ./usr/lib/systemd/user/kclaude.service \
+              ./usr/share/icons/hicolor/scalable/apps/kclaude.svg; do
+              grep -q " $expected\$" <<<"$contents" || { echo "missing: $expected"; exit 1; }
+          done
+          # The unit must point at the packaged collector, not the ~/.local copy.
+          dpkg-deb --fsys-tarfile dist/*.deb | tar -xO ./usr/lib/systemd/user/kclaude.service \
+              | grep -qx 'ExecStart=/usr/bin/kclaude-daemon'
+          # Both formats, or "download and install" is only half true.
+          ls dist/*.rpm >/dev/null
+
+      - name: Installs and removes cleanly
+        run: |
+          sudo apt-get install -y ./dist/*.deb
+          test -f /usr/share/plasma/plasmoids/io.github.schiz0x00.kclaude/metadata.json
+          python3 /usr/bin/kclaude-daemon --selftest
+          sudo apt-get remove -y kclaude
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kclaude-packages
+          path: dist/*
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes --verify-tag
