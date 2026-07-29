@@ -55,6 +55,27 @@ write `usage.json` yourself (format below).
 
 ## Installation
 
+### From a package
+
+Grab the `.deb` or `.rpm` from the [latest
+release](https://github.com/schiz0x00/kclaude/releases/latest):
+
+```bash
+sudo apt install ./kclaude_*_all.deb      # Debian, Ubuntu, KDE neon
+sudo dnf install ./kclaude-*.noarch.rpm   # Fedora
+sudo zypper install ./kclaude-*.noarch.rpm  # openSUSE
+```
+
+This installs the widget system-wide, so every user on the machine can add it.
+The collector is installed but deliberately **not** enabled — it reads your
+credentials, so turning it on stays your call:
+
+```bash
+systemctl --user enable --now kclaude.service
+```
+
+### From source
+
 ```bash
 git clone https://github.com/schiz0x00/kclaude.git
 cd kclaude
@@ -190,6 +211,16 @@ done
 kpackagetool6 --type Plasma/Applet --upgrade . && plasmawindowed io.github.schiz0x00.kclaude
 ```
 
+Building the distributable packages needs [nfpm](https://nfpm.goreleaser.com/)
+on `PATH` (`go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest`):
+
+```bash
+./scripts/build-packages.sh   # -> dist/*.deb, dist/*.rpm
+```
+
+Version comes from `metadata.json`; pushing a `v*` tag builds both and attaches
+them to the GitHub release.
+
 plasmashell caches applet QML, so `systemctl --user restart
 plasma-plasmashell.service` is needed to see changes in the panel. `install.sh`
 offers to do it.
@@ -215,7 +246,8 @@ contents/
 daemon/
   kclaude-daemon              collector (Python 3, stdlib only)
   kclaude.service             systemd user unit
-scripts/                      install.sh, uninstall.sh
+scripts/                      install.sh, uninstall.sh, build-packages.sh
+packaging/                    nfpm.yaml + postinstall for the .deb and .rpm
 docs/                         architecture, testing, i18n
 tests/
   shell-quote.test.js         shell quoting vs a real bash (node)
@@ -224,7 +256,9 @@ tests/
   tst_provider.qml            usage.json parsing, incl. the "error" key
   tst_service.qml             collector detection and auto-start
   tst_timeutils.qml           timestamp parsing and formatting
-.github/workflows/ci.yml      CI: everything except tst_service
+.github/workflows/
+  ci.yml                      tests and linters, everything except tst_service
+  packages.yml                builds the .deb and .rpm, attaches them to v* tags
 ```
 
 ## License
