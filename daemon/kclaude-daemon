@@ -573,13 +573,19 @@ def collect():
     report -- but it is no longer on the hot path, which is the whole point.
     """
     try:
-        return ping_usage()
+        windows = ping_usage()
+        if windows:
+            return windows
+        # A 200 with no rate-limit headers on it. Not an error, and that is the
+        # trap: without this the daemon would back off forever on a widget that
+        # never updates again, because nothing ever raised.
+        reason = "ping carried no rate-limit headers"
     except AuthError:
         raise
     except Exception as e:
-        print(f"kclaude-daemon: ping failed ({e}), falling back to the usage endpoint",
-              file=sys.stderr)
-        return get_usage()
+        reason = f"ping failed ({e})"
+    print(f"kclaude-daemon: {reason}, falling back to the usage endpoint", file=sys.stderr)
+    return get_usage()
 
 
 def parse_interval(argv):
@@ -755,6 +761,35 @@ def selftest():
     # rather than writing 0% over good numbers.
     assert usage_from_headers({}) == {}
     assert usage_from_headers({"anthropic-ratelimit-unified-5h-utilization": "0.5"}) == {}
+
+    # The fallback ladder. The second case is the one worth a test: a 200 with
+    # no headers raises nothing, so without the check collect() would hand
+    # write_usage an empty dict and the daemon would back off forever.
+    global ping_usage, get_usage
+    real_ping, real_endpoint = ping_usage, get_usage
+    endpoint_calls = []
+    get_usage = lambda: (endpoint_calls.append(1), {"five_hour": {"utilization": 5, "resets_at": "T"}})[1]
+    try:
+        ping_usage = lambda: {"five_hour": {"utilization": 70, "resets_at": "T"}}
+        assert collect()["five_hour"]["utilization"] == 70  # ping wins
+        assert not endpoint_calls
+        ping_usage = lambda: {}  # 200, but the headers are gone
+        assert collect()["five_hour"]["utilization"] == 5
+        def boom():
+            raise RuntimeError("model retired")
+        ping_usage = boom
+        assert collect()["five_hour"]["utilization"] == 5
+        def expired():
+            raise AuthError("login expired")
+        ping_usage = expired
+        try:
+            collect()
+            raise SystemExit("selftest: an expired login must not fall back")
+        except AuthError:
+            pass
+        assert len(endpoint_calls) == 2, endpoint_calls
+    finally:
+        ping_usage, get_usage = real_ping, real_endpoint
 
     # At 100% the daemon goes quiet until the window turns over. Retrying into
     # a refusal is the one behaviour this must never have.
