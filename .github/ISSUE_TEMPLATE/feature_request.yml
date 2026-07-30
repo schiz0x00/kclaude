@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest something the widget or collector should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The situation, not the solution. What is awkward today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like it to do instead?
+    validations:
+      required: true
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Does it fit the split?
+      description: >
+        The widget reads one JSON file and never touches the network or your
+        credentials; the collector is the only half with reach. Anything that
+        writes usage.json works as a collector.
+      options:
+        - label: This can be done without giving the widget network or credential access

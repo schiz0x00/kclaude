@@ -3,9 +3,34 @@
 A KDE Plasma 6 panel widget that shows your Claude Code usage limits at a glance:
 the five-hour, weekly and monthly windows, with a colour-coded status dot.
 
+[![CI](https://github.com/schiz0x00/kclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/schiz0x00/kclaude/actions/workflows/ci.yml)
+[![Packages](https://github.com/schiz0x00/kclaude/actions/workflows/packages.yml/badge.svg)](https://github.com/schiz0x00/kclaude/actions/workflows/packages.yml)
+[![Latest release](https://img.shields.io/github/v/release/schiz0x00/kclaude?sort=semver)](https://github.com/schiz0x00/kclaude/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Plasma 6](https://img.shields.io/badge/KDE-Plasma%206-1d99f3)](https://kde.org/plasma-desktop/)
+
+<p align="center">
+  <img src="docs/screenshots/normal.png" alt="The kclaude popup showing the five-hour and weekly windows" width="640">
+</p>
+
 > **Disclaimer:** Unofficial third-party widget. Not affiliated with, endorsed by,
 > or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of
 > Anthropic. This project is not a product of Anthropic.
+
+## Contents
+
+- [Features](#features)
+- [Screenshots](#screenshots)
+- [Security: read this before installing the daemon](#security-read-this-before-installing-the-daemon)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Data format](#data-format)
+- [Daemon](#daemon)
+- [Development](#development)
+- [Layout](#layout)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
@@ -16,6 +41,22 @@ the five-hour, weekly and monthly windows, with a colour-coded status dot.
 - Optional background collector that keeps the numbers current
 - Optionally starts the next 5-hour window the moment the previous one resets
 - No runtime dependencies beyond Plasma 6 and Python 3
+
+## Screenshots
+
+Every state below is reproducible: the widget renders whatever `usage.json`
+says, so none of these needed a real limit to be hit.
+
+| | |
+| --- | --- |
+| **Normal** — under the warning threshold<br><img src="docs/screenshots/normal.png" alt="Usage well under the thresholds" width="380"> | **Warning** — past 75%<br><img src="docs/screenshots/warning.png" alt="The five-hour window in the warning colour" width="380"> |
+| **Critical** — past 90%<br><img src="docs/screenshots/critical.png" alt="The five-hour window in the critical colour" width="380"> | **Spent** — the window is used up<br><img src="docs/screenshots/spent.png" alt="The five-hour window at one hundred percent" width="380"> |
+| **Monthly window** — when the account reports one<br><img src="docs/screenshots/monthly.png" alt="Five-hour, weekly and monthly windows together" width="380"> | **Stale** — nothing has updated the file<br><img src="docs/screenshots/stale.png" alt="Usage marked stale after fifteen minutes" width="380"> |
+| **Login expired** — last good numbers kept<br><img src="docs/screenshots/auth-expired.png" alt="An expired login banner above the last known usage" width="380"> | **First run** — nothing collected yet<br><img src="docs/screenshots/first-run.png" alt="The empty state before any usage has been collected" width="380"> |
+
+<p align="center">
+  <img src="docs/screenshots/settings.png" alt="The kclaude settings dialog" width="560">
+</p>
 
 ## Security: read this before installing the daemon
 
@@ -332,6 +373,9 @@ CI runs everything except `tst_service` (see
 
 ```text
 metadata.json                 Plasma package metadata
+CHANGELOG.md                  what changed, per release
+CONTRIBUTING.md               how to build, test and send a patch
+SECURITY.md                   what the daemon touches, and how to report a hole
 contents/
   ui/                         main.qml, compact + full representations, UsageBar, StatusIndicator
   code/                       UsageModel, FileUsageProvider, ServiceControl, SessionPrimer, Shell.js, TimeUtils.js
@@ -343,6 +387,7 @@ daemon/
 scripts/                      install.sh, uninstall.sh, build-packages.sh
 packaging/                    nfpm.yaml + postinstall for the .deb and .rpm
 docs/                         architecture, testing, i18n
+  screenshots/                every widget state, one PNG each
 tests/
   shell-quote.test.js         shell quoting vs a real bash (node)
   package-layout.test.js      config page location, cfg wiring, package id (node)
@@ -355,6 +400,15 @@ tests/
   ci.yml                      tests and linters, everything except tst_service
   packages.yml                builds the .plasmoid, .deb and .rpm, attaches them to v* tags
 ```
+
+## Contributing
+
+Patches welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the development
+setup, the checks CI runs, and the two rules worth knowing before you start
+(the widget never touches the network; the collector only ever spends
+subscription quota). Release history is in [CHANGELOG.md](CHANGELOG.md).
+
+Found a security problem? Report it privately: see [SECURITY.md](SECURITY.md).
 
 ## License
 

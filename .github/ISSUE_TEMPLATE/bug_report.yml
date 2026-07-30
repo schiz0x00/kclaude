@@ -1,0 +1,69 @@
+name: Bug report
+description: Something the widget or the collector does wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste `~/.claude/.credentials.json` or anything out of it.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: kclaude version
+      description: From the widget's About page, or the package version.
+    validations:
+      required: true
+  - type: input
+    id: plasma
+    attributes:
+      label: Plasma version and distribution
+      placeholder: "Plasma 6.2.4, Fedora 41"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it was installed
+      options:
+        - .deb
+        - .rpm
+        - .plasmoid / KDE Store
+        - scripts/install.sh
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: collector
+    attributes:
+      label: Is the collector installed and running?
+      options:
+        - "Yes, running"
+        - "Installed but stopped"
+        - "Not installed (widget only)"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Collector output
+      description: Only if the collector is installed. Redact anything token-shaped.
+      placeholder: |
+        systemctl --user status kclaude.service
+        journalctl --user -u kclaude -n 50
+      render: shell
