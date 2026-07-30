@@ -29,20 +29,29 @@ MouseArea {
     Accessible.role: Accessible.Button
     Accessible.name: Plasmoid.title
 
-    readonly property var _limitingWindowData: {
+    // The panel always shows the session window, not whichever one happens to be
+    // highest: a number whose meaning silently switches between five-hour and
+    // weekly is unreadable at a glance. The dot still tracks the worst window,
+    // so a weekly limit closing in is not hidden.
+    readonly property var _panelWindowData: {
         var wins = usageModel ? usageModel.windows : []
-        var limitId = usageModel ? usageModel.limitingWindow : ""
-        if (!wins || !limitId) return null
+        if (!wins || wins.length === 0) return null
         for (var i = 0; i < wins.length; i++) {
-            if (wins[i].id === limitId) return wins[i]
+            if (wins[i].id === "five_hour") return wins[i]
+        }
+        // No session window in the file -- a custom collector need not write one
+        // -- so fall back to whatever is closest to its limit.
+        var limitId = usageModel ? usageModel.limitingWindow : ""
+        for (var j = 0; j < wins.length; j++) {
+            if (wins[j].id === limitId) return wins[j]
         }
         return null
     }
 
-    readonly property string _utilText: _limitingWindowData
-        ? Math.round(_limitingWindowData.utilization * 100) + "%" : ""
+    readonly property string _utilText: _panelWindowData
+        ? Math.round(_panelWindowData.utilization * 100) + "%" : ""
 
-    readonly property string _windowName: _limitingWindowData ? _limitingWindowData.name : ""
+    readonly property string _windowName: _panelWindowData ? _panelWindowData.name : ""
 
     // Duplicated in StatusIndicator.qml on purpose: sharing it would need a
     // JS resource with an `.import` of Kirigami, more machinery than the

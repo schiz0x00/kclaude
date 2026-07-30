@@ -117,7 +117,7 @@ Right-click the widget → **Configure**:
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| Compact display mode | Icon + Usage | Icon only, or with the name and/or percentage |
+| Compact display mode | Icon + Usage | Icon only, or with the name and/or percentage. The percentage is always the 5-hour session window; the dot still reflects the worst one |
 | Refresh interval | 60 s | How often the widget re-reads the file, floored at 30 s |
 | Refresh button | — | Re-reads the file *and* asks the collector to poll now |
 | Warning threshold | 75% | Status turns amber at or above this |
