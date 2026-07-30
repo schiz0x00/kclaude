@@ -4,3 +4,5 @@ node_modules/
 screenshots/*.xcf
 *.kate-swp
 .DS_Store
+build/
+dist/

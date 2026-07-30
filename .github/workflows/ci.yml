@@ -1,0 +1,46 @@
+# Runs everything that works without a desktop session.
+#
+# tests/tst_service.qml is deliberately absent: it talks to a real systemd user
+# manager (and, when kclaude.service is installed, stops and restarts it), so
+# it only means something on a developer machine. See docs/testing.md.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell quoting vs a real bash
+        run: node tests/shell-quote.test.js
+      - name: Package layout and config wiring
+        run: node tests/package-layout.test.js
+      - name: Daemon selftest
+        run: python3 daemon/kclaude-daemon --selftest
+      - name: Shellcheck install scripts
+        run: shellcheck scripts/*.sh
+
+  qml:
+    runs-on: ubuntu-latest
+    # Arch tracks current Plasma 6; Ubuntu LTS does not ship the Qt 6 builds of
+    # these modules.
+    container: archlinux:latest
+    steps:
+      - name: Install Plasma 6 QML modules
+        run: >
+          pacman -Syu --noconfirm
+          qt6-declarative libplasma plasma5support kirigami kcmutils
+          ttf-dejavu
+      - uses: actions/checkout@v4
+      - name: qmllint
+        run: /usr/lib/qt6/bin/qmllint contents/ui/*.qml contents/code/*.qml contents/config/*.qml
+      - name: QML tests (hermetic suites)
+        run: |
+          export QT_QPA_PLATFORM=offscreen
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_timeutils.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_provider.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_config.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_primer.qml
