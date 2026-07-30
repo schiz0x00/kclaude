@@ -22,7 +22,9 @@ VERSION="$(python3 -c 'import json,sys; print(json.load(open("metadata.json"))["
 [[ -n "$VERSION" ]] || { echo "Error: no KPlugin.Version in metadata.json" >&2; exit 1; }
 
 STAGE="build/stage"
-rm -rf build
+# dist too, not just build: leftover packages from an older version would
+# otherwise sit next to the new ones and get picked up by a `dist/*` upload.
+rm -rf build dist
 mkdir -p "$STAGE/plasmoid" dist
 
 # Only what belongs inside the Plasma package: not scripts/, daemon/ or docs/.
