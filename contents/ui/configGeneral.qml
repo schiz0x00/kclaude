@@ -83,7 +83,7 @@ KCM.SimpleKCM {
 
         QQC2.Label {
             Kirigami.FormData.label: " "
-            text: page._tr("The collector writes new numbers every 5 minutes, so a shorter\ninterval re-reads identical data.")
+            text: page._tr("The collector writes new numbers every 60 seconds, so a shorter\ninterval re-reads identical data.")
             font: Kirigami.Theme.smallFont
             opacity: 0.7
         }

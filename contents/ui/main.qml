@@ -108,7 +108,7 @@ PlasmoidItem {
 
     Timer {
         id: refreshTimer
-        // Floor at 30s: the collector only writes every 5 minutes, so polling
+        // Floor at 30s: the collector only writes every 60s, so polling
         // faster spawns processes to re-read an unchanged file.
         interval: Math.max(30000, Plasmoid.configuration.refreshInterval * 1000)
         running: true

@@ -3,9 +3,34 @@
 A KDE Plasma 6 panel widget that shows your Claude Code usage limits at a glance:
 the five-hour, weekly and monthly windows, with a colour-coded status dot.
 
+[![CI](https://github.com/schiz0x00/kclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/schiz0x00/kclaude/actions/workflows/ci.yml)
+[![Packages](https://github.com/schiz0x00/kclaude/actions/workflows/packages.yml/badge.svg)](https://github.com/schiz0x00/kclaude/actions/workflows/packages.yml)
+[![Latest release](https://img.shields.io/github/v/release/schiz0x00/kclaude?sort=semver)](https://github.com/schiz0x00/kclaude/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Plasma 6](https://img.shields.io/badge/KDE-Plasma%206-1d99f3)](https://kde.org/plasma-desktop/)
+
+<p align="center">
+  <img src="docs/screenshots/normal.png" alt="The kclaude popup showing the five-hour and weekly windows" width="640">
+</p>
+
 > **Disclaimer:** Unofficial third-party widget. Not affiliated with, endorsed by,
 > or sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of
 > Anthropic. This project is not a product of Anthropic.
+
+## Contents
+
+- [Features](#features)
+- [Screenshots](#screenshots)
+- [Security: read this before installing the daemon](#security-read-this-before-installing-the-daemon)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Data format](#data-format)
+- [Daemon](#daemon)
+- [Development](#development)
+- [Layout](#layout)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
@@ -17,21 +42,45 @@ the five-hour, weekly and monthly windows, with a colour-coded status dot.
 - Optionally starts the next 5-hour window the moment the previous one resets
 - No runtime dependencies beyond Plasma 6 and Python 3
 
+## Screenshots
+
+Every state below is reproducible: the widget renders whatever `usage.json`
+says, so none of these needed a real limit to be hit.
+
+| | |
+| --- | --- |
+| **Normal** — under the warning threshold<br><img src="docs/screenshots/normal.png" alt="Usage well under the thresholds" width="380"> | **Warning** — past 75%<br><img src="docs/screenshots/warning.png" alt="The five-hour window in the warning colour" width="380"> |
+| **Critical** — past 90%<br><img src="docs/screenshots/critical.png" alt="The five-hour window in the critical colour" width="380"> | **Spent** — the window is used up<br><img src="docs/screenshots/spent.png" alt="The five-hour window at one hundred percent" width="380"> |
+| **Monthly window** — when the account reports one<br><img src="docs/screenshots/monthly.png" alt="Five-hour, weekly and monthly windows together" width="380"> | **Stale** — nothing has updated the file<br><img src="docs/screenshots/stale.png" alt="Usage marked stale after fifteen minutes" width="380"> |
+| **Login expired** — last good numbers kept<br><img src="docs/screenshots/auth-expired.png" alt="An expired login banner above the last known usage" width="380"> | **First run** — nothing collected yet<br><img src="docs/screenshots/first-run.png" alt="The empty state before any usage has been collected" width="380"> |
+
+<p align="center">
+  <img src="docs/screenshots/settings.png" alt="The kclaude settings dialog" width="560">
+</p>
+
 ## Security: read this before installing the daemon
 
 The widget alone is inert: it reads one JSON file and draws it. **The optional
 collector daemon is the part that touches your credentials.** Specifically it:
 
 - Reads the OAuth token Claude Code stores in `~/.claude/.credentials.json`.
-- Calls `GET https://api.anthropic.com/api/oauth/usage` with that token.
+- Calls `POST https://api.anthropic.com/v1/messages` with that token once a
+  minute — an 8-token Haiku message whose reply is discarded. The usage numbers
+  come from the rate-limit headers on the response, which is the only way to get
+  them without the far scarcer usage endpoint. **So the collector spends a
+  little of your quota continuously**, about 9 tokens a minute, and each message
+  opens a five-hour window if none is running.
+- Falls back to `GET https://api.anthropic.com/api/oauth/usage` with that token
+  when a ping fails.
 - When the token has expired, refreshes it against
   `https://platform.claude.com/v1/oauth/token` using Claude Code's own OAuth
   client id, and **writes the refreshed token back to
   `~/.claude/.credentials.json`** — a file the daemon does not own.
-- Only if you switch session priming on: calls `POST
-  https://api.anthropic.com/v1/messages` with that token, once per five-hour
-  reset. This is the only request that spends anything. Off by default;
-  see [Starting the next 5-hour window on reset](#starting-the-next-5-hour-window-on-reset).
+- Identifies itself as `claude-cli` (user-agent, `x-app`, session-id header),
+  since the token and the OAuth client id are Claude Code's either way.
+- If you switch session priming on, one further `POST /v1/messages` per
+  five-hour reset. See
+  [Starting the next 5-hour window on reset](#starting-the-next-5-hour-window-on-reset).
 
 Consequences worth weighing:
 
@@ -46,11 +95,12 @@ Consequences worth weighing:
   immediately before writing and replaces only the `claudeAiOauth` key, so the
   keys Claude Code owns survive. This narrows the race to microseconds but cannot
   eliminate it — Claude Code does not take the daemon's lock.
-- **Priming sends inference requests, not just reads.** Reusing the OAuth client
-  id to *ask Claude something* is a bigger imposition than reading a usage
-  figure, which is the other reason it is opt-in. It draws on the subscription the
-  token belongs to and refuses to run at all unless the credential is an OAuth
-  token, so it cannot reach API billing.
+- **The collector sends inference requests, not just reads.** Reusing the OAuth
+  client id to *ask Claude something* is a bigger imposition than reading a
+  usage figure. Every such request draws on the subscription the token belongs
+  to, and refuses to go out at all unless the credential is an OAuth token, so
+  none of it can reach API billing. A window at 100% stops them entirely until
+  it resets, rather than retrying into a refusal.
 - Tokens never leave your machine except to the Anthropic endpoints above,
   are never logged, and the credential file is rewritten mode `0600`.
 
@@ -84,6 +134,13 @@ credentials, so turning it on stays your call:
 systemctl --user enable --now kclaude.service
 ```
 
+The same release also carries a `.plasmoid`: the widget on its own, no
+collector, for a per-user install or the KDE Store.
+
+```bash
+kpackagetool6 --type Plasma/Applet --install kclaude-*.plasmoid
+```
+
 ### From source
 
 ```bash
@@ -107,9 +164,10 @@ in CI it takes the default for every prompt.
 
 ```bash
 kpackagetool6 --type Plasma/Applet --install .
-# the "Add Widgets" browser resolves the icon by name, so it needs a copy:
+# optional: the icon already resolves from inside the package, but a copy in
+# the icon theme makes it available to anything else that looks it up by name.
 mkdir -p ~/.local/share/icons/hicolor/scalable/apps
-cp contents/icons/claude.svg ~/.local/share/icons/hicolor/scalable/apps/kclaude.svg
+cp contents/icons/kclaude.svg ~/.local/share/icons/hicolor/scalable/apps/kclaude.svg
 ```
 
 ### Uninstall
@@ -287,15 +345,16 @@ done
 kpackagetool6 --type Plasma/Applet --upgrade . && plasmawindowed io.github.schiz0x00.kclaude
 ```
 
-Building the distributable packages needs [nfpm](https://nfpm.goreleaser.com/)
-on `PATH` (`go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest`):
+Building the `.deb` and `.rpm` needs [nfpm](https://nfpm.goreleaser.com/) on
+`PATH` (`go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest`). The
+`.plasmoid` is built before that step, so it works without one:
 
 ```bash
-./scripts/build-packages.sh   # -> dist/*.deb, dist/*.rpm
+./scripts/build-packages.sh   # -> dist/*.plasmoid, dist/*.deb, dist/*.rpm
 ```
 
-Version comes from `metadata.json`; pushing a `v*` tag builds both and attaches
-them to the GitHub release.
+Version comes from `metadata.json`; pushing a `v*` tag builds all three and
+attaches them to the GitHub release.
 
 plasmashell caches applet QML, so `systemctl --user restart
 plasma-plasmashell.service` is needed to see changes in the panel. `install.sh`
@@ -314,17 +373,21 @@ CI runs everything except `tst_service` (see
 
 ```text
 metadata.json                 Plasma package metadata
+CHANGELOG.md                  what changed, per release
+CONTRIBUTING.md               how to build, test and send a patch
+SECURITY.md                   what the daemon touches, and how to report a hole
 contents/
   ui/                         main.qml, compact + full representations, UsageBar, StatusIndicator
   code/                       UsageModel, FileUsageProvider, ServiceControl, SessionPrimer, Shell.js, TimeUtils.js
   config/                     main.xml + the configuration form
-  icons/claude.svg
+  icons/kclaude.svg
 daemon/
   kclaude-daemon              collector (Python 3, stdlib only)
   kclaude.service             systemd user unit
 scripts/                      install.sh, uninstall.sh, build-packages.sh
 packaging/                    nfpm.yaml + postinstall for the .deb and .rpm
 docs/                         architecture, testing, i18n
+  screenshots/                every widget state, one PNG each
 tests/
   shell-quote.test.js         shell quoting vs a real bash (node)
   package-layout.test.js      config page location, cfg wiring, package id (node)
@@ -335,8 +398,17 @@ tests/
   tst_timeutils.qml           timestamp parsing and formatting
 .github/workflows/
   ci.yml                      tests and linters, everything except tst_service
-  packages.yml                builds the .deb and .rpm, attaches them to v* tags
+  packages.yml                builds the .plasmoid, .deb and .rpm, attaches them to v* tags
 ```
+
+## Contributing
+
+Patches welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the development
+setup, the checks CI runs, and the two rules worth knowing before you start
+(the widget never touches the network; the collector only ever spends
+subscription quota). Release history is in [CHANGELOG.md](CHANGELOG.md).
+
+Found a security problem? Report it privately: see [SECURITY.md](SECURITY.md).
 
 ## License
 
