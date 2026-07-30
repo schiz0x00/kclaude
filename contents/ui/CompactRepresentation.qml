@@ -80,7 +80,7 @@ MouseArea {
             Kirigami.Icon {
                 anchors.fill: parent
                 // Bundled, so it works however the package was installed.
-                source: Qt.resolvedUrl("../icons/claude.svg")
+                source: Qt.resolvedUrl("../icons/kclaude.svg")
                 active: root.containsMouse
             }
 

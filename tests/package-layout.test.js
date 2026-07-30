@@ -57,8 +57,19 @@ for (const e of entries) {
     check(`${e} has a control`, aliases.has(e), "declared in main.xml but not exposed by the form");
 }
 
+// The icon has to resolve from inside the package. A store install goes through
+// kpackagetool6 and copies nothing into hicolor, so an Icon name with no
+// matching contents/icons/<name>.svg shows a generic placeholder in Add Widgets
+// -- and only for the users who arrive that way, which is why it survives every
+// local install test.
+const metadata = JSON.parse(read("metadata.json"));
+const iconName = metadata.KPlugin.Icon;
+check(`contents/icons/${iconName}.svg exists`,
+      fs.existsSync(path.join(repo, "contents", "icons", `${iconName}.svg`)),
+      `metadata.json Icon is "${iconName}", so the package needs contents/icons/${iconName}.svg`);
+
 // The metadata id has to match what the scripts install and remove.
-const id = JSON.parse(read("metadata.json")).KPlugin.Id;
+const id = metadata.KPlugin.Id;
 for (const script of ["scripts/install.sh", "scripts/uninstall.sh"]) {
     check(`${script} uses the metadata id`, read(script).includes(`PACKAGE_ID="${id}"`),
           `expected PACKAGE_ID="${id}"`);

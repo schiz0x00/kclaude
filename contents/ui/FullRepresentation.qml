@@ -83,7 +83,7 @@ Item {
                 spacing: Kirigami.Units.smallSpacing
 
                 Kirigami.Icon {
-                    source: Qt.resolvedUrl("../icons/claude.svg")
+                    source: Qt.resolvedUrl("../icons/kclaude.svg")
                     implicitWidth: Kirigami.Units.iconSizes.smallMedium
                     implicitHeight: Kirigami.Units.iconSizes.smallMedium
                 }
@@ -271,7 +271,7 @@ Item {
 
                 PlasmaComponents3.Button {
                     text: i18n("Open Claude") // qmllint disable unqualified
-                    icon.source: Qt.resolvedUrl("../icons/claude.svg")
+                    icon.source: Qt.resolvedUrl("../icons/kclaude.svg")
                     icon.color: "transparent"  // keep the brand colour, no theme recolouring
                     Layout.fillWidth: true
                     onClicked: Qt.openUrlExternally("https://claude.ai")

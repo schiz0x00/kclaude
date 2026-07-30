@@ -40,7 +40,7 @@ contents:
     file_info:
       mode: 0644
   # The "Add Widgets" browser resolves metadata.json's Icon by name, not path.
-  - src: contents/icons/claude.svg
+  - src: contents/icons/kclaude.svg
     dst: /usr/share/icons/hicolor/scalable/apps/kclaude.svg
     file_info:
       mode: 0644

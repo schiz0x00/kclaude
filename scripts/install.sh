@@ -85,7 +85,7 @@ fi
 # "Add Widgets" browser can resolve metadata.json's Icon name.
 ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
 mkdir -p "$ICON_DIR"
-cp "$PROJECT_DIR/contents/icons/claude.svg" "$ICON_DIR/kclaude.svg"
+cp "$PROJECT_DIR/contents/icons/kclaude.svg" "$ICON_DIR/kclaude.svg"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kclaude"
 mkdir -p "$STATE_DIR"
