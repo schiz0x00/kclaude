@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Builds dist/kclaude_<version>_all.deb and dist/kclaude-<version>.noarch.rpm.
+# Builds, into dist/:
+#   kclaude-<version>.plasmoid       for the KDE Store and kpackagetool6
+#   kclaude_<version>_all.deb
+#   kclaude-<version>.noarch.rpm
 #
-#   ./scripts/build-packages.sh          # needs nfpm on PATH
+#   ./scripts/build-packages.sh          # .deb and .rpm need nfpm on PATH
 #
 # The staging step exists because a system package and a per-user install put
 # things in different places: kpackagetool6 copies a source tree, the package
@@ -10,12 +13,6 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
-
-if ! command -v nfpm &>/dev/null; then
-    echo "Error: nfpm not found. Install with:" >&2
-    echo "  go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest" >&2
-    exit 1
-fi
 
 # One version, from the file Plasma already reads it out of.
 VERSION="$(python3 -c 'import json,sys; print(json.load(open("metadata.json"))["KPlugin"]["Version"])')"
@@ -42,6 +39,40 @@ grep -q '^ExecStart=/usr/bin/kclaude-daemon$' "$STAGE/kclaude.service" || {
     echo "Error: could not rewrite ExecStart in daemon/kclaude.service" >&2
     exit 1
 }
+
+# The .plasmoid is just that staged tree zipped, with metadata.json at the root
+# rather than inside a directory -- kpackagetool6 and the KDE Store both reject
+# a nested one. Built before the nfpm gate below, so it can be produced without
+# a Go toolchain installed.
+#
+# python3, not zip(1): the version is already read with it, and this way the
+# script needs nothing that is not already required.
+PLASMOID="dist/kclaude-$VERSION.plasmoid"
+python3 - "$STAGE/plasmoid" "$PLASMOID" <<'PY'
+import os, sys, zipfile
+
+root, out = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for directory, _, files in os.walk(root):
+        for name in sorted(files):
+            path = os.path.join(directory, name)
+            z.write(path, os.path.relpath(path, root))
+PY
+# A .plasmoid whose metadata is one level down installs as a broken package and
+# says nothing about why, so check the one thing that makes it valid.
+python3 - "$PLASMOID" <<'PY'
+import sys, zipfile
+
+names = zipfile.ZipFile(sys.argv[1]).namelist()
+if "metadata.json" not in names:
+    sys.exit(f"Error: {sys.argv[1]} has no metadata.json at its root (got {names[:3]}...)")
+PY
+
+if ! command -v nfpm &>/dev/null; then
+    echo "Error: nfpm not found, so only the .plasmoid was built. Install with:" >&2
+    echo "  go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest" >&2
+    exit 1
+fi
 
 export KCLAUDE_VERSION="$VERSION"
 for format in deb rpm; do

@@ -1,4 +1,4 @@
-# Builds the installable .deb and .rpm. Runs on every push so a broken package
+# Builds the installable .plasmoid, .deb and .rpm. Runs on every push so a broken package
 # layout shows up immediately, and attaches them to the GitHub release when a
 # v* tag is pushed.
 name: Packages
@@ -53,6 +53,9 @@ jobs:
               | grep -qx 'ExecStart=/usr/bin/kclaude-daemon'
           # Both formats, or "download and install" is only half true.
           ls dist/*.rpm >/dev/null
+          # The store artifact, with metadata.json at the zip root: nested
+          # metadata installs as a broken package and explains nothing.
+          unzip -l dist/*.plasmoid | grep -qE ' metadata\.json$'
 
       - name: Installs and removes cleanly
         run: |

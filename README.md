@@ -23,15 +23,23 @@ The widget alone is inert: it reads one JSON file and draws it. **The optional
 collector daemon is the part that touches your credentials.** Specifically it:
 
 - Reads the OAuth token Claude Code stores in `~/.claude/.credentials.json`.
-- Calls `GET https://api.anthropic.com/api/oauth/usage` with that token.
+- Calls `POST https://api.anthropic.com/v1/messages` with that token once a
+  minute — an 8-token Haiku message whose reply is discarded. The usage numbers
+  come from the rate-limit headers on the response, which is the only way to get
+  them without the far scarcer usage endpoint. **So the collector spends a
+  little of your quota continuously**, about 9 tokens a minute, and each message
+  opens a five-hour window if none is running.
+- Falls back to `GET https://api.anthropic.com/api/oauth/usage` with that token
+  when a ping fails.
 - When the token has expired, refreshes it against
   `https://platform.claude.com/v1/oauth/token` using Claude Code's own OAuth
   client id, and **writes the refreshed token back to
   `~/.claude/.credentials.json`** — a file the daemon does not own.
-- Only if you switch session priming on: calls `POST
-  https://api.anthropic.com/v1/messages` with that token, once per five-hour
-  reset. This is the only request that spends anything. Off by default;
-  see [Starting the next 5-hour window on reset](#starting-the-next-5-hour-window-on-reset).
+- Identifies itself as `claude-cli` (user-agent, `x-app`, session-id header),
+  since the token and the OAuth client id are Claude Code's either way.
+- If you switch session priming on, one further `POST /v1/messages` per
+  five-hour reset. See
+  [Starting the next 5-hour window on reset](#starting-the-next-5-hour-window-on-reset).
 
 Consequences worth weighing:
 
@@ -46,11 +54,12 @@ Consequences worth weighing:
   immediately before writing and replaces only the `claudeAiOauth` key, so the
   keys Claude Code owns survive. This narrows the race to microseconds but cannot
   eliminate it — Claude Code does not take the daemon's lock.
-- **Priming sends inference requests, not just reads.** Reusing the OAuth client
-  id to *ask Claude something* is a bigger imposition than reading a usage
-  figure, which is the other reason it is opt-in. It draws on the subscription the
-  token belongs to and refuses to run at all unless the credential is an OAuth
-  token, so it cannot reach API billing.
+- **The collector sends inference requests, not just reads.** Reusing the OAuth
+  client id to *ask Claude something* is a bigger imposition than reading a
+  usage figure. Every such request draws on the subscription the token belongs
+  to, and refuses to go out at all unless the credential is an OAuth token, so
+  none of it can reach API billing. A window at 100% stops them entirely until
+  it resets, rather than retrying into a refusal.
 - Tokens never leave your machine except to the Anthropic endpoints above,
   are never logged, and the credential file is rewritten mode `0600`.
 
@@ -84,6 +93,13 @@ credentials, so turning it on stays your call:
 systemctl --user enable --now kclaude.service
 ```
 
+The same release also carries a `.plasmoid`: the widget on its own, no
+collector, for a per-user install or the KDE Store.
+
+```bash
+kpackagetool6 --type Plasma/Applet --install kclaude-*.plasmoid
+```
+
 ### From source
 
 ```bash
@@ -107,9 +123,10 @@ in CI it takes the default for every prompt.
 
 ```bash
 kpackagetool6 --type Plasma/Applet --install .
-# the "Add Widgets" browser resolves the icon by name, so it needs a copy:
+# optional: the icon already resolves from inside the package, but a copy in
+# the icon theme makes it available to anything else that looks it up by name.
 mkdir -p ~/.local/share/icons/hicolor/scalable/apps
-cp contents/icons/claude.svg ~/.local/share/icons/hicolor/scalable/apps/kclaude.svg
+cp contents/icons/kclaude.svg ~/.local/share/icons/hicolor/scalable/apps/kclaude.svg
 ```
 
 ### Uninstall
@@ -287,15 +304,16 @@ done
 kpackagetool6 --type Plasma/Applet --upgrade . && plasmawindowed io.github.schiz0x00.kclaude
 ```
 
-Building the distributable packages needs [nfpm](https://nfpm.goreleaser.com/)
-on `PATH` (`go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest`):
+Building the `.deb` and `.rpm` needs [nfpm](https://nfpm.goreleaser.com/) on
+`PATH` (`go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest`). The
+`.plasmoid` is built before that step, so it works without one:
 
 ```bash
-./scripts/build-packages.sh   # -> dist/*.deb, dist/*.rpm
+./scripts/build-packages.sh   # -> dist/*.plasmoid, dist/*.deb, dist/*.rpm
 ```
 
-Version comes from `metadata.json`; pushing a `v*` tag builds both and attaches
-them to the GitHub release.
+Version comes from `metadata.json`; pushing a `v*` tag builds all three and
+attaches them to the GitHub release.
 
 plasmashell caches applet QML, so `systemctl --user restart
 plasma-plasmashell.service` is needed to see changes in the panel. `install.sh`
@@ -318,7 +336,7 @@ contents/
   ui/                         main.qml, compact + full representations, UsageBar, StatusIndicator
   code/                       UsageModel, FileUsageProvider, ServiceControl, SessionPrimer, Shell.js, TimeUtils.js
   config/                     main.xml + the configuration form
-  icons/claude.svg
+  icons/kclaude.svg
 daemon/
   kclaude-daemon              collector (Python 3, stdlib only)
   kclaude.service             systemd user unit
@@ -335,7 +353,7 @@ tests/
   tst_timeutils.qml           timestamp parsing and formatting
 .github/workflows/
   ci.yml                      tests and linters, everything except tst_service
-  packages.yml                builds the .deb and .rpm, attaches them to v* tags
+  packages.yml                builds the .plasmoid, .deb and .rpm, attaches them to v* tags
 ```
 
 ## License
