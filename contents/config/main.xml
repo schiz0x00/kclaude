@@ -5,8 +5,8 @@
         <entry name="compactMode" type="Int">
             <default>2</default>
         </entry>
-        <!-- The collector only writes every 5 minutes, so re-reading the file
-             faster than 60s just spawns processes for identical data. -->
+        <!-- The collector only writes every 60s, so re-reading the file
+             faster than that just spawns processes for identical data. -->
         <entry name="refreshInterval" type="Int">
             <default>60</default>
         </entry>

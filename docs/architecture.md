@@ -6,8 +6,8 @@ Two independent halves, joined by one JSON file:
 ┌─────────────────────────┐        ┌──────────────────────────────┐
 │ collector daemon        │ writes │ ~/.local/state/kclaude/      │
 │ (Python 3, stdlib only) │──────► │ usage.json                   │
-│ polls the usage API     │        └──────────────┬───────────────┘
-│ every 5 minutes         │                       │ reads (cat)
+│ pings the messages API  │        └──────────────┬───────────────┘
+│ every 60 seconds        │                       │ reads (cat)
 └───────────┬─────────────┘        ┌──────────────▼───────────────┐
             │ SIGUSR1 = poll now   │ Plasma widget (QML only)     │
             └──────────────────────│ panel dot + popup bars       │
@@ -195,14 +195,39 @@ an unfamiliar prefix: refusing to prime is always cheaper than guessing which
 account pays. No `x-api-key` header is ever set and no `ANTHROPIC_API_KEY` is
 read anywhere in the daemon, so the bearer token is the only credential in play.
 
+### Where the numbers come from
+
+Not from `/api/oauth/usage`. That endpoint has an account-wide quota measured
+(2026-07) at roughly one call every two minutes, with a slow refill and hours
+of 429s once drained — polling it every 5 minutes drained it. Claude Code does
+not hit this because it barely uses the endpoint: its own bars come from the
+`anthropic-ratelimit-unified-*` headers that ride on every `/v1/messages`
+reply.
+
+So the daemon reads the same headers, off its own ping: Haiku, no system
+prompt, one character of content, `max_tokens: 1` — 8 input tokens and 1 output
+token, about $0.00002. `/v1/messages` has no scarce limit at this rate. The
+usage endpoint stays as the fallback when a ping fails.
+
+The cost is that a ping opens a five-hour window when none is running, so one
+is open around the clock. `primeOnReset` does that deliberately anyway.
+
 ### Rate-limit discipline
 
-The usage endpoint 429s well below one call every 30s. Three layers keep the
-widget from ever hammering it: the daemon polls every 5 minutes and floors
-manual pokes at 30s (`MIN_POLL_GAP`); the widget floors its Refresh button at
-30s (`pollCooldownMs`) and its systemctl start attempts at 15s; and during an
-error backoff a manual poke waits out the whole backoff rather than
-short-circuiting it.
+Three layers still bound the request rate: the daemon polls every 60s and
+floors manual pokes at 30s (`MIN_POLL_GAP`); the widget floors its Refresh
+button at 30s (`pollCooldownMs`) and its systemctl start attempts at 15s; and
+during an error backoff a manual poke waits out the whole backoff rather than
+short-circuiting it. A 429 leaves the last good numbers in place rather than
+replacing them with an error.
+
+A window at 100% is the fourth: the daemon stops pinging entirely and sleeps
+until that window's reset (`exhausted_until`), because no request can succeed
+before then — a Refresh click cannot buy a number the server will not give, so
+the wait is the floor for manual pokes too. The first ping after the reset is
+what opens the new five-hour window. Every window is checked, not just the
+five-hour one, since a spent weekly budget refuses the same request for days;
+no wait outlives one window's length.
 
 ### systemd unit choices
 

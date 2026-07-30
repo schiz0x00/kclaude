@@ -194,8 +194,14 @@ unit is missing, the popup says so and shows the command. Turn the auto-start of
 in the settings if you would rather drive it yourself.
 
 The widget reads a file; it never makes network calls itself. The collector
-writes that file every 5 minutes, so a refresh interval below 60 s only re-reads
+writes that file every 60 s, so a refresh interval below 60 s only re-reads
 identical data. Data older than 15 minutes is shown as stale rather than fresh.
+
+The numbers come from the rate-limit headers on a tiny message the collector
+sends to `/v1/messages` — 8 input tokens and 1 output token of Haiku, the same
+source Claude Code's own `/usage` bars use. `/api/oauth/usage` is a fallback
+only: its quota is far too small to poll. One consequence: that message opens a
+five-hour window when none is running, so one stays open around the clock.
 
 ## Data format
 

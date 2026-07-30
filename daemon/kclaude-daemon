@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Polls the Claude account usage endpoint and writes usage.json for the plasmoid.
+"""Polls the Claude account's usage numbers and writes usage.json for the plasmoid.
+
+Reads them off the anthropic-ratelimit-unified-* headers of a tiny /v1/messages
+ping, the same numbers Claude Code shows, with /api/oauth/usage kept only as a
+fallback -- see DEFAULT_INTERVAL.
 
 Reads the OAuth token Claude Code stores in ~/.claude/.credentials.json, and
 writes a refreshed token back when it expires. See the Security section of the
 README: this daemon shares a credential file it does not own.
 """
 import contextlib
+import datetime
 import fcntl
 import json
 import os
@@ -17,6 +22,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "kclaude")
 USAGE_FILE = os.path.join(STATE_DIR, "usage.json")
@@ -53,10 +59,22 @@ OAUTH_BETA = "oauth-2025-04-20"
 # (2026-07), not from any published contract -- so treat a sudden 400 here as
 # this having changed, and re-check before assuming the token itself is bad.
 PRIME_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
-# Truthful rather than an imitation of claude-cli's. Reusing Claude Code's OAuth
-# client id is already the outer limit of what this should do; forging its
-# user-agent on top would also rot the moment claude-cli's version string moves.
-USER_AGENT = "kclaude-daemon (+https://github.com/schiz0x00/kclaude)"
+# The usage ping: the same request stripped to the bone, sent for the
+# rate-limit headers on the reply rather than for the reply. No system prompt
+# (measured: 22 input tokens with it, 8 without, and the endpoint serves it
+# either way as of 2026-07), one character of content, one token out. This is
+# the poll -- see DEFAULT_INTERVAL for why it beats the usage endpoint.
+PING_TEXT = "h"
+PING_MAX_TOKENS = 1
+# Claude Code's own client identity, reproduced rather than declared. The token
+# is Claude Code's, the OAuth client id is Claude Code's, and the endpoints only
+# exist for Claude Code -- a separate user-agent bought nothing except being the
+# odd one out. Version is read from the installed claude at runtime (see
+# claude_cli_version) so it tracks the real client instead of rotting here.
+CLAUDE_VERSIONS_DIR = os.path.expanduser("~/.local/share/claude/versions")
+# Fallback when no installed version can be read. Stale is survivable; absent
+# is not, since the header has to say something.
+CLAUDE_VERSION_FALLBACK = "2.1.220"
 # Priming is the only thing here that spends anything, so it is the only thing
 # that has to be sure *what* it spends. A Claude Code OAuth access token
 # ("sk-ant-oat01-") draws on the subscription; an API key ("sk-ant-api03-")
@@ -65,11 +83,32 @@ USER_AGENT = "kclaude-daemon (+https://github.com/schiz0x00/kclaude)"
 # rather than guessing which account pays.
 OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 
-# The endpoint rate-limits well below one call every 30s. The widget treats data
-# older than 15 minutes as stale, so 5 minutes leaves a 3x margin.
-DEFAULT_INTERVAL = 300
+# The numbers come off a ping, not off /api/oauth/usage.
+#
+# /api/oauth/usage is scarce: an account-wide quota, measured (2026-07) at
+# roughly one call per two minutes with a slow refill, that 429s for hours once
+# drained. Polling it every five minutes is what drained it. Claude Code does
+# not have this problem because it barely uses that endpoint.
+#
+# /v1/messages is not scarce -- Claude Code hammers it all day -- and every 200
+# carries anthropic-ratelimit-unified-*, which is the same data, account-wide,
+# so it also covers usage from claude.ai or another machine. A ping is 8 input
+# tokens and 1 output token of Haiku. At 60s that is ~13k tokens a day against a
+# budget measured in millions: cheaper than being wrong about the numbers.
+#
+# The one real cost: a ping opens a five-hour window if none is running, so the
+# widget keeps one open around the clock. That is what primeOnReset does on
+# purpose anyway.
+DEFAULT_INTERVAL = 60
 MIN_INTERVAL = 60
 MAX_BACKOFF = 3600
+# A window at 100% refuses every request until it turns over, so the daemon
+# goes quiet until then rather than backing off into a wall. Nothing waits
+# longer than one window's length.
+FIVE_HOURS = 5 * 3600
+# Wake just after the reset, not exactly on it: clocks disagree by seconds and
+# an early ping just earns another refusal.
+RESET_SLACK = 10
 # A held-down Refresh button must not turn into an API hammer. The usage
 # endpoint returns 429 well below one call every 30s, so this is the floor for
 # manually requested polls, not a nicety.
@@ -233,12 +272,45 @@ def token_expired(oauth):
     return time.time() * 1000 >= expires_at - TOKEN_SKEW_MS
 
 
-def fetch_usage(access_token):
-    req = urllib.request.Request(USAGE_URL, headers={
+def claude_cli_version():
+    """The newest installed claude version, or the fallback.
+
+    Numeric sort, not lexicographic: "2.1.220" has to beat "2.1.99".
+    """
+    try:
+        names = os.listdir(CLAUDE_VERSIONS_DIR)
+    except OSError:
+        return CLAUDE_VERSION_FALLBACK
+    versions = []
+    for name in names:
+        parts = name.split(".")
+        if parts and all(p.isdigit() for p in parts):
+            versions.append((tuple(int(p) for p in parts), name))
+    return max(versions)[1] if versions else CLAUDE_VERSION_FALLBACK
+
+
+# One per process, like claude-cli's per-session id. Read once: the version
+# cannot change under a running daemon without the systemd unit restarting it.
+CLI_VERSION = claude_cli_version()
+SESSION_ID = str(uuid.uuid4())
+
+
+def cli_headers(access_token):
+    """The header block claude-cli puts on every authenticated request."""
+    return {
         "Authorization": f"Bearer {access_token}",
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
-    })
+        "x-app": "cli",
+        "User-Agent": f"claude-cli/{CLI_VERSION} (external, cli)",
+        "X-Claude-Code-Session-Id": SESSION_ID,
+    }
+
+
+def fetch_usage(access_token):
+    # Matches claude-cli's own GET of this endpoint: the shared block and
+    # nothing else -- it sends no anthropic-beta here, so neither do we.
+    req = urllib.request.Request(USAGE_URL, headers=cli_headers(access_token))
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.load(resp)
 
@@ -270,31 +342,124 @@ def get_usage():
     return with_token(fetch_usage)
 
 
-def prime_request(access_token):
-    """The priming request, built but not sent, so a test can inspect it.
+def messages_request(access_token, body, what):
+    """A /v1/messages request, built but not sent, so a test can inspect it.
 
     Authorization is the OAuth bearer token and nothing else: no x-api-key
     header, and no ANTHROPIC_API_KEY is read anywhere in this file, so there is
-    no path by which this request reaches API billing.
+    no path by which this request reaches API billing. Every caller spends
+    subscription quota, so every caller goes through the same allowlist.
     """
     if not isinstance(access_token, str) or not access_token.startswith(OAUTH_TOKEN_PREFIX):
         raise AuthError(
-            "refusing to prime: the credential is not a Claude Code OAuth token "
-            f"(expected {OAUTH_TOKEN_PREFIX}...), and priming must only ever spend "
-            "subscription usage")
-    body = json.dumps({
+            f"refusing to {what}: the credential is not a Claude Code OAuth token "
+            f"(expected {OAUTH_TOKEN_PREFIX}...), and spending must only ever come "
+            "out of the subscription")
+    return urllib.request.Request(MESSAGES_URL, data=json.dumps(body).encode(), method="POST", headers={
+        **cli_headers(access_token),
+        "anthropic-beta": OAUTH_BETA,
+    })
+
+
+def prime_request(access_token):
+    """The priming request: opens a five-hour window, deliberately."""
+    return messages_request(access_token, {
         "model": PRIME_MODEL,
         "max_tokens": PRIME_MAX_TOKENS,
         "system": PRIME_SYSTEM,
         "messages": [{"role": "user", "content": PRIME_TEXT}],
-    }).encode()
-    return urllib.request.Request(MESSAGES_URL, data=body, method="POST", headers={
-        "Authorization": f"Bearer {access_token}",
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": OAUTH_BETA,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    })
+    }, "prime")
+
+
+def ping_request(access_token):
+    """The usage ping: sent for its response headers, not its reply."""
+    return messages_request(access_token, {
+        "model": PRIME_MODEL,
+        "max_tokens": PING_MAX_TOKENS,
+        "messages": [{"role": "user", "content": PING_TEXT}],
+    }, "ping")
+
+
+def usage_from_headers(headers):
+    """anthropic-ratelimit-unified-* -> the same shape /api/oauth/usage returns.
+
+    Same shape on purpose, percentages and all, so normalize_windows stays the
+    one place that knows what the widget wants -- the headers give a 0-1
+    fraction and a unix epoch, the endpoint gives 0-100 and an ISO string.
+    """
+    raw = {}
+    for key, prefix in (("five_hour", "5h"), ("seven_day", "7d")):
+        try:
+            utilization = float(headers.get(f"anthropic-ratelimit-unified-{prefix}-utilization"))
+            reset = int(headers.get(f"anthropic-ratelimit-unified-{prefix}-reset"))
+        except (TypeError, ValueError):
+            continue
+        raw[key] = {
+            "utilization": utilization * 100.0,
+            "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset)),
+        }
+    return raw
+
+
+def ping_usage():
+    """Read the usage numbers off a ~9-token message instead of the endpoint.
+
+    A 429 here means the account is out of quota, and the refusal carries the
+    same headers the success would have -- so it is data, not an error. Reading
+    it is what lets the loop go quiet until the window resets instead of
+    retrying into a wall.
+    """
+    def send(access_token):
+        try:
+            with urllib.request.urlopen(ping_request(access_token), timeout=30) as resp:
+                return usage_from_headers(resp.headers)
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            # ponytail: unverified -- reproducing it means exhausting a real
+            # five-hour window. If the refusal turns out to carry no headers,
+            # this falls through to the endpoint and then to plain backoff,
+            # which is the old behaviour, so being wrong here costs nothing.
+            windows = usage_from_headers(e.headers)
+            if not windows:
+                raise
+            return windows
+
+    return with_token(send)
+
+
+def exhausted_until(raw, now=None):
+    """Seconds until every exhausted window has reset, or None if none is.
+
+    At 100% the next ping cannot succeed: it would be refused until the window
+    turns over. So the only useful thing to do is wait for the reset -- and
+    then ping once, which opens the new window.
+
+    Every window is checked, not just the five-hour one: a spent weekly budget
+    refuses the same request for days.
+    """
+    now = time.time() if now is None else now
+    waits = []
+    for window in raw.values():
+        if not isinstance(window, dict):
+            continue
+        utilization = window.get("utilization")
+        if not isinstance(utilization, (int, float)) or utilization < 100.0:
+            continue
+        try:
+            reset = datetime.datetime.fromisoformat(window["resets_at"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            # Exhausted with no reset time to wait for. An hour is the wrong
+            # answer by at most an hour, and never a busy loop.
+            waits.append(MAX_BACKOFF)
+            continue
+        # A little past the reset, not exactly on it: server and local clocks
+        # disagree by seconds, and waking early just earns another refusal.
+        # Capped, so a bogus timestamp cannot park the daemon for a week.
+        waits.append(min(FIVE_HOURS, max(0.0, reset - now) + RESET_SLACK))
+    return max(waits) if waits else None
+
+
 
 
 def last_prime_at():
@@ -400,6 +565,23 @@ def retry_after(error, fallback):
         return fallback
 
 
+def collect():
+    """One round of numbers: the ping, with the usage endpoint as the fallback.
+
+    The endpoint stays reachable for the cases the headers do not cover -- a
+    retired ping model, a window key this account has that the headers do not
+    report -- but it is no longer on the hot path, which is the whole point.
+    """
+    try:
+        return ping_usage()
+    except AuthError:
+        raise
+    except Exception as e:
+        print(f"kclaude-daemon: ping failed ({e}), falling back to the usage endpoint",
+              file=sys.stderr)
+        return get_usage()
+
+
 def parse_interval(argv):
     if len(argv) <= 1:
         return DEFAULT_INTERVAL
@@ -422,10 +604,17 @@ def main():
     while True:
         last_poll = time.monotonic()
         try:
-            write_usage(get_usage())
+            raw = collect()
+            write_usage(raw)
             backoff = interval
-            delay = interval
-            wake_floor = MIN_POLL_GAP
+            spent = exhausted_until(raw)
+            delay = interval if spent is None else spent
+            # Out of quota is not a pace to nudge: a Refresh click cannot buy a
+            # number the server will not give, so the wait is the floor too.
+            wake_floor = MIN_POLL_GAP if spent is None else delay
+            if spent is not None:
+                print(f"kclaude-daemon: limit reached, quiet for {spent / 60:.0f}m "
+                      "until the window resets", file=sys.stderr)
         except AuthError as e:
             print(f"kclaude-daemon: {e}", file=sys.stderr)
             write_error(str(e))
@@ -483,7 +672,7 @@ def main():
 
 
 def selftest():
-    global CREDENTIALS_FILE, STATE_DIR, LOCK_FILE, PRIME_STAMP_FILE
+    global CREDENTIALS_FILE, STATE_DIR, LOCK_FILE, PRIME_STAMP_FILE, CLAUDE_VERSIONS_DIR
 
     assert normalize_windows({"five_hour": {"utilization": 68, "resets_at": "T"}}) == {
         "five_hour": {"utilization": 0.68, "resetAt": "T"}
@@ -519,15 +708,78 @@ def selftest():
     assert primer.get_header("Authorization") == "Bearer sk-ant-oat01-tok"
     assert primer.get_header("Anthropic-beta") == OAUTH_BETA
     assert primer.get_header("Anthropic-version") == "2023-06-01"
-    # Says what it is rather than imitating claude-cli. If this ever has to
-    # change to get served, that is a finding worth noticing, not a silent tweak.
-    assert primer.get_header("User-agent") == USER_AGENT
+    # claude-cli's identity, deliberately. Shape matters more than the version:
+    # the endpoints only serve this client.
+    assert primer.get_header("User-agent") == f"claude-cli/{CLI_VERSION} (external, cli)"
+    assert primer.get_header("X-app") == "cli"
+    assert primer.get_header("X-claude-code-session-id") == SESSION_ID
+    # Numeric, not lexicographic: 220 > 99.
+    with tempfile.TemporaryDirectory() as d:
+        for name in ("2.1.99", "2.1.220", "notaversion"):
+            os.mkdir(os.path.join(d, name))
+        CLAUDE_VERSIONS_DIR = d
+        assert claude_cli_version() == "2.1.220"
+        CLAUDE_VERSIONS_DIR = os.path.join(d, "missing")
+        assert claude_cli_version() == CLAUDE_VERSION_FALLBACK
     body = json.loads(primer.data)
     assert body["system"].startswith("You are Claude Code"), body
     assert body["messages"] == [{"role": "user", "content": PRIME_TEXT}], body
     # Exactly 1, not 0: a zero-token request generates nothing, and the whole
     # point is that a completion happened. See PRIME_MAX_TOKENS.
     assert body["max_tokens"] == 1, body
+
+    # The ping goes through the same allowlist: it spends too, just barely.
+    for rejected in ("sk-ant-api03-xxxx", "", None):
+        try:
+            ping_request(rejected)
+            raise SystemExit(f"selftest: ping_request accepted {rejected!r}")
+        except AuthError:
+            pass
+    ping_body = json.loads(ping_request("sk-ant-oat01-tok").data)
+    # No system prompt: it is the whole difference between 22 tokens and 8.
+    assert "system" not in ping_body, ping_body
+    assert ping_body["max_tokens"] == PING_MAX_TOKENS, ping_body
+
+    # Headers in, endpoint shape out, so normalize_windows stays the only place
+    # that knows the widget's units.
+    assert normalize_windows(usage_from_headers({
+        "anthropic-ratelimit-unified-5h-utilization": "0.62",
+        "anthropic-ratelimit-unified-5h-reset": "1785388800",
+        "anthropic-ratelimit-unified-7d-utilization": "0.47",
+        "anthropic-ratelimit-unified-7d-reset": "1785754800",
+    })) == {
+        "five_hour": {"utilization": 0.62, "resetAt": "2026-07-30T05:20:00Z"},
+        "seven_day": {"utilization": 0.47, "resetAt": "2026-08-03T11:00:00Z"},
+    }
+    # A reply without the headers yields nothing, which write_usage rejects
+    # rather than writing 0% over good numbers.
+    assert usage_from_headers({}) == {}
+    assert usage_from_headers({"anthropic-ratelimit-unified-5h-utilization": "0.5"}) == {}
+
+    # At 100% the daemon goes quiet until the window turns over. Retrying into
+    # a refusal is the one behaviour this must never have.
+    now = datetime.datetime.fromisoformat("2026-07-30T05:00:00Z").timestamp()
+    spent = {"five_hour": {"utilization": 100.0, "resets_at": "2026-07-30T05:20:00Z"}}
+    assert exhausted_until(spent, now) == 20 * 60 + RESET_SLACK
+    # Not exhausted -> no wait, so the normal interval stands.
+    assert exhausted_until({"five_hour": {"utilization": 99.9, "resets_at": "T"}}, now) is None
+    assert exhausted_until({}, now) is None
+    # A weekly budget that is spent refuses the same request for days: wait for
+    # the window that frees the request, not the one that resets soonest.
+    assert exhausted_until({
+        "five_hour": {"utilization": 100.0, "resets_at": "2026-07-30T05:20:00Z"},
+        "seven_day": {"utilization": 100.0, "resets_at": "2026-07-30T06:00:00Z"},
+    }, now) == 60 * 60 + RESET_SLACK
+    # ...and no wait outlives one window, however far off the reset claims to be.
+    assert exhausted_until(
+        {"seven_day": {"utilization": 100.0, "resets_at": "2026-08-03T05:00:00Z"}},
+        now) == FIVE_HOURS
+    # A reset already in the past means wake now, not a negative sleep.
+    assert exhausted_until(
+        {"five_hour": {"utilization": 100.0, "resets_at": "2026-07-30T04:00:00Z"}},
+        now) == RESET_SLACK
+    # Exhausted with an unusable reset time still waits, rather than spinning.
+    assert exhausted_until({"five_hour": {"utilization": 100.0}}, now) == MAX_BACKOFF
 
     class FakeErr:
         headers = {"Retry-After": "120"}
