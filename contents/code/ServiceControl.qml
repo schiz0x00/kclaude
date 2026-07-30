@@ -121,6 +121,18 @@ Item {
         return true
     }
 
+    // Opens a new five-hour window: SIGUSR2 makes the collector send one small
+    // message. Distinct signal from the poll above on purpose -- a refresh must
+    // never be able to spend usage -- and only SessionPrimer calls this.
+    //
+    // Nothing to do if the collector is not running: it holds the token, so
+    // there is no other way to send anything, and starting it would not prime.
+    function requestPrime() {
+        if (root.serviceState !== "active") return false
+        _poller.connectSource("systemctl --user kill -s USR2 " + root.unit)
+        return true
+    }
+
     function _applyState(out) {
         var load = /LoadState=(\S+)/.exec(out)
         var active = /ActiveState=(\S+)/.exec(out)

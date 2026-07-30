@@ -14,6 +14,7 @@ the five-hour, weekly and monthly windows, with a colour-coded status dot.
 - Configurable warning and critical thresholds (defaults 75% / 90%)
 - Countdown to the next limit reset
 - Optional background collector that keeps the numbers current
+- Optionally starts the next 5-hour window the moment the previous one resets
 - No runtime dependencies beyond Plasma 6 and Python 3
 
 ## Security: read this before installing the daemon
@@ -27,10 +28,14 @@ collector daemon is the part that touches your credentials.** Specifically it:
   `https://platform.claude.com/v1/oauth/token` using Claude Code's own OAuth
   client id, and **writes the refreshed token back to
   `~/.claude/.credentials.json`** — a file the daemon does not own.
+- Only if you switch session priming on: calls `POST
+  https://api.anthropic.com/v1/messages` with that token, once per five-hour
+  reset. This is the only request that spends anything. Off by default;
+  see [Starting the next 5-hour window on reset](#starting-the-next-5-hour-window-on-reset).
 
 Consequences worth weighing:
 
-- **Both endpoints are undocumented and unversioned.** They can change or
+- **These endpoints are undocumented and unversioned.** They can change or
   disappear without notice, and reusing Claude Code's OAuth client id may not be
   something Anthropic's terms permit. Treat this as a best-effort tool.
 - **A token refresh rotates your refresh token.** That is why the daemon refuses
@@ -41,7 +46,12 @@ Consequences worth weighing:
   immediately before writing and replaces only the `claudeAiOauth` key, so the
   keys Claude Code owns survive. This narrows the race to microseconds but cannot
   eliminate it — Claude Code does not take the daemon's lock.
-- Tokens never leave your machine except to the two Anthropic endpoints above,
+- **Priming sends inference requests, not just reads.** Reusing the OAuth client
+  id to *ask Claude something* is a bigger imposition than reading a usage
+  figure, which is the other reason it is opt-in. It draws on the subscription the
+  token belongs to and refuses to run at all unless the credential is an OAuth
+  token, so it cannot reach API billing.
+- Tokens never leave your machine except to the Anthropic endpoints above,
   are never logged, and the credential file is rewritten mode `0600`.
 
 If none of that is acceptable, install the widget without `--with-daemon` and
@@ -125,8 +135,56 @@ Right-click the widget → **Configure**:
 | Usage file path | `~/.local/state/kclaude/usage.json` | |
 | Refresh on popup open | on | Re-read the file when the popup opens |
 | Start collector on popup open | on | Starts an installed-but-stopped collector. Never installs it |
+| Start the next 5-hour window on reset | **off** | Sends one `hi` through the collector when the window resets. See below |
 | Show tooltip | on | |
 | Show reset countdown | on | |
+
+### Starting the next 5-hour window on reset
+
+The five-hour window does not run on a fixed schedule: it starts when you send
+your first message, so a late start pushes the whole window (and every one after
+it) later into the day. With this on, the widget notices the window expiring and
+asks the collector to send a single `hi`, which opens the next one on the clock
+instead.
+
+Off by default, because it spends a little of the usage it is watching. What it
+does and does not do:
+
+- **One message per expiry.** The widget arms only on a five-hour window it saw
+  while that window was still running, and settles that window as soon as one
+  message goes out. The collector refuses a second prime within an hour
+  regardless — a floor it keeps on disk, so a restart loop cannot reset it — and
+  so a bug upstream of it cannot turn into a stream of requests.
+- **Retried for ten minutes, then dropped.** If the collector is not up yet at
+  the moment of the reset, the widget keeps asking on its 30-second tick until
+  one gets through. Ten minutes past the reset it gives up: by then the window
+  is well under way and a late message would spend for nothing.
+- **Never on a refresh.** Neither the refresh timer, nor opening the popup, nor
+  the **Refresh** button can prime. Refresh is `SIGUSR1` (poll the usage
+  endpoint); priming is `SIGUSR2`, and the only thing that raises it is a window
+  expiring. `tests/tst_primer.qml` pins this.
+- **Subscription usage, never API billing.** The request carries the Claude Code
+  OAuth token (`sk-ant-oat…`) and nothing else — no `x-api-key`, and the daemon
+  reads no `ANTHROPIC_API_KEY` anywhere. Before sending, it checks that the
+  credential really is an OAuth token and refuses outright otherwise, so an API
+  key (`sk-ant-api…`) in that file can never be spent. An unrecognised prefix
+  also refuses rather than guessing which account pays.
+- **`max_tokens: 1` on the cheapest model.** The reply is thrown away; only the
+  fact of the request matters. Not `max_tokens: 0` — that generates nothing, and
+  the window needs a real completion.
+- Nothing happens if plasmashell is not running at the moment of the reset, or if
+  the collector stays down for the whole ten minutes — it holds the token, so
+  there is no other path.
+
+To do it by hand, with or without the setting:
+
+```bash
+systemctl --user kill -s USR2 kclaude.service   # collector running
+~/.local/bin/kclaude-daemon --prime-now         # collector stopped
+```
+
+Priming is logged to the journal, including the model that served it and the
+reason when it fails.
 
 When the popup opens, the widget starts the collector if it is installed but
 not running, then picks up the first numbers a few seconds later. It will not
@@ -191,6 +249,18 @@ Manually requested polls are floored at 30s apart, and a refresh request will no
 short-circuit an error backoff. The usage endpoint returns `429 Too Many Requests`
 well below one call every 30s, so both limits matter.
 
+`SIGUSR2` is the other half: send one message to open a new five-hour window.
+This is the only thing the daemon does that spends usage, it is floored at one
+per hour, and `SIGUSR1` can never trigger it.
+
+```bash
+systemctl --user kill -s USR2 kclaude.service
+~/.local/bin/kclaude-daemon --prime-now   # only if no daemon is running
+```
+
+`--prime-now` takes the same lock the daemon holds and refuses if one is already
+running, rather than risk two processes refreshing the token at once.
+
 ## Development
 
 ```bash
@@ -240,7 +310,7 @@ CI runs everything except `tst_service` (see
 metadata.json                 Plasma package metadata
 contents/
   ui/                         main.qml, compact + full representations, UsageBar, StatusIndicator
-  code/                       UsageModel, FileUsageProvider, ServiceControl, Shell.js, TimeUtils.js
+  code/                       UsageModel, FileUsageProvider, ServiceControl, SessionPrimer, Shell.js, TimeUtils.js
   config/                     main.xml + the configuration form
   icons/claude.svg
 daemon/
@@ -254,6 +324,7 @@ tests/
   package-layout.test.js      config page location, cfg wiring, package id (node)
   tst_config.qml              config page renders and every setting is wired
   tst_provider.qml            usage.json parsing, incl. the "error" key
+  tst_primer.qml              when a new 5-hour window is opened, and when not
   tst_service.qml             collector detection and auto-start
   tst_timeutils.qml           timestamp parsing and formatting
 .github/workflows/

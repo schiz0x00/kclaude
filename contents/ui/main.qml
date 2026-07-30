@@ -25,6 +25,28 @@ PlasmoidItem {
         onPollRequested: postActionRefresh.restart()
     }
 
+    CodeModule.SessionPrimer {
+        id: sessionPrimer
+        active: Plasmoid.configuration.primeOnReset
+        resetAt: {
+            var wins = usageSource.windows
+            for (var i = 0; i < wins.length; i++) {
+                if (wins[i].id === "five_hour") return wins[i].resetAt || ""
+            }
+            return ""
+        }
+        // The only caller of requestPrime, and it only fires when a five-hour
+        // window that was running has expired. No refresh path reaches this.
+        // The re-read is already covered: requestPrime goes out on the same
+        // source that emits pollRequested.
+        //
+        // confirm() only when it really went out. requestPrime returns false
+        // while the collector is not active -- which is what the first seconds
+        // after a plasmashell start look like -- and settling the window on that
+        // would throw the prime away for good.
+        onPrimeRequested: if (collectorService.requestPrime()) sessionPrimer.confirm()
+    }
+
     // The collector needs a moment for its HTTPS call after being started or
     // poked. Re-read a few times so a slow request is still picked up promptly
     // rather than waiting out the whole refresh interval.

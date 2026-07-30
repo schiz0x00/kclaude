@@ -62,9 +62,15 @@ The daemon side of the contract is pinned by `--selftest`
 | `contents/ui/UsageBar.qml`, `StatusIndicator.qml` | presentation only |
 | `contents/code/UsageModel.qml` | keeps last good state, derives status/limiting window |
 | `contents/code/FileUsageProvider.qml` | reads + validates usage.json |
-| `contents/code/ServiceControl.qml` | queries/starts the systemd unit, SIGUSR1 poke |
+| `contents/code/ServiceControl.qml` | queries/starts the systemd unit, SIGUSR1 poke, SIGUSR2 prime |
+| `contents/code/SessionPrimer.qml` | decides when a new five-hour window should be opened |
 | `contents/code/Shell.js` | the only shell-quoting code (see Security) |
 | `contents/code/TimeUtils.js` | formatting + status thresholds |
+
+The panel percentage is always the five-hour window (`CompactRepresentation`
+looks up `five_hour` directly), because a number whose denominator changes on its
+own cannot be read at a glance. The status dot is not: it follows the worst
+window, so an approaching weekly limit still shows.
 
 Status is derived from the *most utilized* window: `active` → `warning`
 (default 75%) → `critical` (90%) → `limit_reached` (100%), with `offline`
@@ -141,6 +147,53 @@ the credentials file on every poll, so recovery is automatic. 5xx and network
 failures stay on the generic path: exponential backoff up to an hour,
 `Retry-After` honoured (and capped, so a hostile header cannot park the
 daemon).
+
+### Why the widget decides when to prime, and the daemon sends it
+
+Session priming needs two things that live on opposite sides of the file
+contract: the setting (a widget config key, in plasmashell's applet config) and
+the credentials (the daemon's). Rather than teach the daemon to find and parse an
+applet's config group, the widget decides *when* and the daemon decides *how*:
+`SessionPrimer` raises a signal, `ServiceControl` turns it into
+`systemctl --user kill -s USR2`, and the daemon sends the message.
+
+Priming is a separate signal from the poll poke on purpose. Refresh must never
+be able to spend usage, and a single signal with a "which action" flag would put
+that guarantee in a payload rather than in the kernel's signal number.
+
+The cost is that priming needs plasmashell running with the widget in the panel.
+That is when a five-hour window is worth aligning anyway, and the alternative --
+a daemon reading a Plasma applet config group by index -- is far more fragile
+than the feature is valuable.
+
+Arming is what keeps it to one message per window: the primer only counts a
+five-hour window it observed while that window still had time left, and a reset
+time already in the past the first time it is seen (which is what a plasmashell
+restart looks like) arms nothing.
+
+A window disarms on delivery, not on the attempt. `ServiceControl.requestPrime()`
+returns false while the unit is not active — the first seconds after a
+plasmashell start look exactly like that — so the handler only calls
+`SessionPrimer.confirm()` when the signal really went out, and otherwise the
+window stays armed for the next 30-second tick. Retrying is free (the check is
+local; nothing is sent), and bounded: ten minutes past the reset the primer gives
+up rather than opening a window that is already well under way.
+`tests/tst_primer.qml` covers each case, including both ends of that bound.
+
+The daemon's own hourly floor is the backstop under all of it, and it lives in
+`~/.local/state/kclaude/last-prime` rather than in memory — an in-memory counter
+would let a crash-restart loop spend once per crash, which is the case the floor
+exists to bound.
+
+### Priming must not reach API billing
+
+The token in `~/.claude/.credentials.json` is a Claude Code OAuth token
+(`sk-ant-oat…`) and draws on the subscription. An API key (`sk-ant-api…`) in the
+same field would draw on prepaid credits. `prime_request` therefore checks the
+prefix against an allowlist and raises `AuthError` for anything else, including
+an unfamiliar prefix: refusing to prime is always cheaper than guessing which
+account pays. No `x-api-key` header is ever set and no `ANTHROPIC_API_KEY` is
+read anywhere in the daemon, so the bearer token is the only credential in play.
 
 ### Rate-limit discipline
 

@@ -34,6 +34,7 @@ On distros that do not put Qt 6 tools on PATH, they live in
 | `tst_provider.qml` | widget side of the file contract: valid/malformed payloads, the `error` key (with and without windows), sanitization + caps | a collector change blanking the panel; HTML-ish file content reaching a rich-text label |
 | `tst_config.qml` | the page is a real `Kirigami.Page` pushed onto a real `PageRow`, renders controls, clamps values, exposes every `cfg_*` | the historical blank-config-page bug; qmllint cannot catch it |
 | `tst_timeutils.qml` | timestamp parsing **under Qt's JS engine** (which is what runs it, not node), including the API's 6-digit fractional seconds; "NaN" never renders | "NaNd NaNh" in the panel |
+| `tst_primer.qml` | when a new five-hour window is opened and, mostly, when it is not: refresh never primes, one prime per expiry, a stale reset time does not repeat, an expiry seen only after the fact does nothing, an undelivered prime is retried and then bounded | a regression here spends real subscription usage, possibly in a loop |
 | `tst_service.qml` | `systemctl show` output parsing against captured strings; start cooldown; `becameActive` edge; plus two **live** tests against the real user manager | auto-start reporting a false "inactive"; restarting an already-running collector |
 
 ## CI
@@ -43,7 +44,7 @@ On distros that do not put Qt 6 tools on PATH, they live in
 - **unit** (ubuntu-latest): both node suites, the daemon selftest, shellcheck.
 - **qml** (Arch container — Ubuntu LTS does not ship the Qt 6 builds of these
   modules): qmllint plus the three hermetic QML suites
-  (`tst_timeutils`, `tst_provider`, `tst_config`).
+  (`tst_timeutils`, `tst_provider`, `tst_config`, `tst_primer`).
 
 `tst_service.qml` is deliberately not in CI: its last two tests talk to a
 real systemd user manager, and when `kclaude.service` is installed they stop

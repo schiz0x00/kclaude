@@ -43,3 +43,4 @@ jobs:
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_timeutils.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_provider.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_config.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_primer.qml

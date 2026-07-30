@@ -21,11 +21,49 @@ import urllib.request
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "kclaude")
 USAGE_FILE = os.path.join(STATE_DIR, "usage.json")
 LOCK_FILE = os.path.join(STATE_DIR, "daemon.lock")
+PRIME_STAMP_FILE = os.path.join(STATE_DIR, "last-prime")
 CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
 
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+# Session priming: one throwaway message, sent to open the next five-hour
+# window at the moment the previous one expires.
+#
+# The cheapest model there is. Pinned to the dated id rather than the
+# "claude-haiku-4-5" alias on purpose: an alias that moves under us would change
+# what this spends without the change showing up in a diff. Retirement shows up
+# as a 404 in the journal, which is the failure we would rather have.
+# ponytail: assumes any model opens the five-hour window. If a Haiku call turns
+# out not to start it, switch to "claude-sonnet-4-5".
+PRIME_MODEL = "claude-haiku-4-5-20251001"
+PRIME_TEXT = "hi"
+# max_tokens 1, deliberately not 0. A zero-token request is the documented way to
+# run prefill *without* generating anything -- which is the opposite of what this
+# needs. The window has to see a real completion, and one Haiku output token
+# costs about five millionths of a dollar, so there is nothing here worth saving.
+PRIME_MAX_TOKENS = 1
+# Documented: /v1/messages rejects an OAuth bearer token outright without this
+# beta opt-in.
+OAUTH_BETA = "oauth-2025-04-20"
+# NOT documented: the endpoint also appears to reject an OAuth token unless the
+# system prompt identifies the caller as Claude Code. Determined empirically
+# (2026-07), not from any published contract -- so treat a sudden 400 here as
+# this having changed, and re-check before assuming the token itself is bad.
+PRIME_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+# Truthful rather than an imitation of claude-cli's. Reusing Claude Code's OAuth
+# client id is already the outer limit of what this should do; forging its
+# user-agent on top would also rot the moment claude-cli's version string moves.
+USER_AGENT = "kclaude-daemon (+https://github.com/schiz0x00/kclaude)"
+# Priming is the only thing here that spends anything, so it is the only thing
+# that has to be sure *what* it spends. A Claude Code OAuth access token
+# ("sk-ant-oat01-") draws on the subscription; an API key ("sk-ant-api03-")
+# draws on prepaid API credits, i.e. real money, and must never be used here.
+# An allowlist, not a denylist: an unrecognised credential refuses to prime
+# rather than guessing which account pays.
+OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 
 # The endpoint rate-limits well below one call every 30s. The widget treats data
 # older than 15 minutes as stale, so 5 minutes leaves a 3x margin.
@@ -36,6 +74,11 @@ MAX_BACKOFF = 3600
 # endpoint returns 429 well below one call every 30s, so this is the floor for
 # manually requested polls, not a nicety.
 MIN_POLL_GAP = 30
+# Priming spends quota, so the floor matters more than it does for a poll. One
+# five-hour window can only need one prime; an hourly ceiling means a widget
+# stuck in a loop costs one tiny message an hour instead of thousands. Kept on
+# disk rather than in memory, so a restart loop cannot reset it either.
+MIN_PRIME_GAP = 3600
 # Refresh the token this long before it actually expires.
 TOKEN_SKEW_MS = 5 * 60 * 1000
 
@@ -88,39 +131,50 @@ def single_instance_lock():
 
 
 class Waker:
-    """Lets SIGUSR1 cut the poll interval short, so the widget's Refresh button
-    can force an immediate poll without restarting the daemon.
+    """Lets a signal cut the poll interval short: SIGUSR1 to poll now (the
+    widget's Refresh button), SIGUSR2 to open a new five-hour window.
 
     Uses set_wakeup_fd + select rather than a flag checked around time.sleep:
     PEP 475 makes time.sleep resume after a handler returns, and touching a lock
     from inside a handler can deadlock against the code it interrupted.
     """
 
+    SIGNALS = (signal.SIGUSR1, signal.SIGUSR2)
+
     def __init__(self):
         self._r, self._w = os.pipe()
         os.set_blocking(self._r, False)
         os.set_blocking(self._w, False)
         signal.set_wakeup_fd(self._w)
-        # A Python-level handler has to exist or SIGUSR1 keeps its default
-        # action, which is to kill the process.
-        signal.signal(signal.SIGUSR1, lambda *_: None)
+        for sig in self.SIGNALS:
+            # A Python-level handler has to exist or the signal keeps its default
+            # action, which is to kill the process.
+            signal.signal(sig, lambda *_: None)
 
     def wait(self, seconds):
-        """Sleep up to `seconds`. Returns True if a signal cut it short."""
+        """Sleep up to `seconds`. Returns the signal numbers that arrived, as a
+        set, empty if the wait simply ran out."""
         deadline = time.monotonic() + seconds
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return False
+                return frozenset()
             try:
                 ready, _, _ = select.select([self._r], [], [], remaining)
             except InterruptedError:
                 continue
             if not ready:
-                return False
-            with contextlib.suppress(BlockingIOError):
-                os.read(self._r, 4096)
-            return True
+                return frozenset()
+            # set_wakeup_fd writes one byte per signal: the signal number. Both
+            # can be pending at once, so read the lot and report all of them.
+            try:
+                return frozenset(os.read(self._r, 4096))
+            except BlockingIOError:
+                # select() said readable but the read would block: a spurious
+                # wake, not a signal. Returning an empty set here would be
+                # indistinguishable from the wait running out, and the caller
+                # paces on exactly that difference -- keep waiting instead.
+                continue
 
 
 def load_credentials():
@@ -189,7 +243,12 @@ def fetch_usage(access_token):
         return json.load(resp)
 
 
-def get_usage():
+def with_token(call):
+    """Run call(access_token), refreshing the token once if it is rejected.
+
+    Every authenticated request goes through here, so the refresh-on-401 rule
+    cannot be forgotten by a new caller.
+    """
     try:
         oauth = load_credentials()["claudeAiOauth"]
     except FileNotFoundError:
@@ -200,11 +259,91 @@ def get_usage():
     # request to discover it.
     access_token = refresh_access_token(oauth) if token_expired(oauth) else oauth["accessToken"]
     try:
-        return fetch_usage(access_token)
+        return call(access_token)
     except urllib.error.HTTPError as e:
         if e.code != 401:
             raise
-        return fetch_usage(refresh_access_token(oauth))
+        return call(refresh_access_token(oauth))
+
+
+def get_usage():
+    return with_token(fetch_usage)
+
+
+def prime_request(access_token):
+    """The priming request, built but not sent, so a test can inspect it.
+
+    Authorization is the OAuth bearer token and nothing else: no x-api-key
+    header, and no ANTHROPIC_API_KEY is read anywhere in this file, so there is
+    no path by which this request reaches API billing.
+    """
+    if not isinstance(access_token, str) or not access_token.startswith(OAUTH_TOKEN_PREFIX):
+        raise AuthError(
+            "refusing to prime: the credential is not a Claude Code OAuth token "
+            f"(expected {OAUTH_TOKEN_PREFIX}...), and priming must only ever spend "
+            "subscription usage")
+    body = json.dumps({
+        "model": PRIME_MODEL,
+        "max_tokens": PRIME_MAX_TOKENS,
+        "system": PRIME_SYSTEM,
+        "messages": [{"role": "user", "content": PRIME_TEXT}],
+    }).encode()
+    return urllib.request.Request(MESSAGES_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": OAUTH_BETA,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    })
+
+
+def last_prime_at():
+    """When the last prime went out, as a wall-clock epoch.
+
+    Wall clock rather than monotonic because this has to survive a restart:
+    an in-memory counter would let a crash-restart loop spend once per crash,
+    which is exactly the case MIN_PRIME_GAP exists to bound.
+    """
+    try:
+        with open(PRIME_STAMP_FILE) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return float("-inf")
+
+
+def record_prime(when=None):
+    write_atomic(PRIME_STAMP_FILE, str(time.time() if when is None else when), mode=0o600)
+
+
+def prime_gap_elapsed():
+    """True if enough time has passed since the last prime.
+
+    A stamp in the future means the clock moved backwards (an NTP step, a
+    suspend). Treat that as unknown and allow, rather than locking priming out
+    until the clock catches up.
+    """
+    since = time.time() - last_prime_at()
+    return not (0 <= since < MIN_PRIME_GAP), since
+
+
+def prime_session():
+    """Send one message, so the five-hour window starts now.
+
+    Costs a sliver of the quota this daemon exists to watch. That is the trade
+    the setting is there to make: the window opens on a schedule the user picked
+    instead of whenever they happen to type something.
+    """
+    def send(access_token):
+        with urllib.request.urlopen(prime_request(access_token), timeout=30) as resp:
+            return json.load(resp)
+
+    reply = with_token(send)
+    # Stamp only once the request came back: a failed prime must not consume the
+    # hourly allowance, or one outage would suppress the next real attempt too.
+    record_prime()
+    # The reply is discarded, but its model confirms the request was really
+    # served rather than answered from some cache or proxy.
+    print(f"kclaude-daemon: session primed ({reply.get('model', 'unknown model')})", file=sys.stderr)
 
 
 def normalize_windows(raw):
@@ -306,20 +445,45 @@ def main():
             # wait: that is exactly how one 429 becomes a hammer.
             wake_floor = delay
         # Jitter avoids lockstep retries across restarts.
-        if waker.wait(delay + random.uniform(0, min(15, delay * 0.1))):
-            # Woken by SIGUSR1 (the widget asking for a poll now). Pace it, and
-            # say so: a manual refresh that did nothing is worth being able to see.
+        woke = waker.wait(delay + random.uniform(0, min(15, delay * 0.1)))
+
+        if signal.SIGUSR2 in woke:
+            # The widget saw the five-hour window run out and wants the next one
+            # opened now.
+            elapsed, since_prime = prime_gap_elapsed()
+            if not elapsed:
+                print(f"kclaude-daemon: prime requested, refused: only "
+                      f"{since_prime / 60:.0f}m since the last one", file=sys.stderr)
+            else:
+                try:
+                    prime_session()
+                except Exception as e:
+                    # A failed prime must not disturb the poll loop: the widget
+                    # keeps working, and the reason is in the journal.
+                    print(f"kclaude-daemon: prime failed: {e}", file=sys.stderr)
+
+        if signal.SIGUSR1 in woke:
+            # A manual refresh that did nothing is worth being able to see.
+            print("kclaude-daemon: poll requested", file=sys.stderr)
+
+        # Every branch above falls through to the top of the loop, which polls
+        # straight away -- so the floor belongs here, once, rather than in the
+        # branch that happens to have remembered it. A prime that was refused or
+        # that failed must not become a way around the pacing a refresh gets, and
+        # during an error backoff wake_floor is the whole backoff, so no signal
+        # can short-circuit it. A prime that succeeded lands here too: the
+        # numbers on screen are stale until the next poll, but the poll that
+        # opened this wait can be seconds old, and that is exactly how an
+        # immediate re-poll earns a 429 and doubles the backoff for no reason.
+        if woke:
             since = time.monotonic() - last_poll
             if since < wake_floor:
-                print(f"kclaude-daemon: poll requested, pacing {wake_floor - since:.0f}s",
-                      file=sys.stderr)
+                print(f"kclaude-daemon: pacing {wake_floor - since:.0f}s", file=sys.stderr)
                 time.sleep(wake_floor - since)
-            else:
-                print("kclaude-daemon: poll requested", file=sys.stderr)
 
 
 def selftest():
-    global CREDENTIALS_FILE, STATE_DIR, LOCK_FILE
+    global CREDENTIALS_FILE, STATE_DIR, LOCK_FILE, PRIME_STAMP_FILE
 
     assert normalize_windows({"five_hour": {"utilization": 68, "resets_at": "T"}}) == {
         "five_hour": {"utilization": 0.68, "resetAt": "T"}
@@ -334,6 +498,36 @@ def selftest():
     assert parse_interval(["x"]) == DEFAULT_INTERVAL
     assert parse_interval(["x", "5"]) == MIN_INTERVAL  # clamped up
     assert parse_interval(["x", "900"]) == 900
+
+    # The priming request is unusual enough to pin: /v1/messages rejects an
+    # OAuth bearer token outright without the beta opt-in, and (empirically --
+    # see PRIME_SYSTEM) without the Claude Code system prompt. A silently
+    # malformed body would just look like the window refusing to open.
+    # Nothing but a subscription token may be spent. An API key here would bill
+    # prepaid credits, so it has to be a hard refusal, not a warning.
+    for rejected in ("sk-ant-api03-xxxx", "sk-ant-", "", None, 42):
+        try:
+            prime_request(rejected)
+            raise SystemExit(f"selftest: prime_request accepted {rejected!r}")
+        except AuthError:
+            pass
+
+    primer = prime_request("sk-ant-oat01-tok")
+    assert primer.full_url == MESSAGES_URL
+    assert primer.get_header("X-api-key") is None
+    assert primer.get_method() == "POST"
+    assert primer.get_header("Authorization") == "Bearer sk-ant-oat01-tok"
+    assert primer.get_header("Anthropic-beta") == OAUTH_BETA
+    assert primer.get_header("Anthropic-version") == "2023-06-01"
+    # Says what it is rather than imitating claude-cli. If this ever has to
+    # change to get served, that is a finding worth noticing, not a silent tweak.
+    assert primer.get_header("User-agent") == USER_AGENT
+    body = json.loads(primer.data)
+    assert body["system"].startswith("You are Claude Code"), body
+    assert body["messages"] == [{"role": "user", "content": PRIME_TEXT}], body
+    # Exactly 1, not 0: a zero-token request generates nothing, and the whole
+    # point is that a completion happened. See PRIME_MAX_TOKENS.
+    assert body["max_tokens"] == 1, body
 
     class FakeErr:
         headers = {"Retry-After": "120"}
@@ -435,11 +629,50 @@ def selftest():
         assert second is not None  # freed once the holder exits
         os.close(second)
 
+        # The hourly prime ceiling lives on disk, so a restart loop cannot spend
+        # once per restart. Absent stamp means "never primed" -> allowed.
+        PRIME_STAMP_FILE = os.path.join(STATE_DIR, "last-prime")
+        assert last_prime_at() == float("-inf")
+        assert prime_gap_elapsed()[0]
+        record_prime()
+        assert not prime_gap_elapsed()[0], "a prime one second ago must refuse"
+        assert os.stat(PRIME_STAMP_FILE).st_mode & 0o777 == 0o600
+        record_prime(time.time() - MIN_PRIME_GAP - 1)
+        assert prime_gap_elapsed()[0], "past the gap must allow"
+        # A stamp in the future means the clock stepped backwards. Allow rather
+        # than locking priming out until the clock catches up.
+        record_prime(time.time() + 86400)
+        assert prime_gap_elapsed()[0], "a future stamp must not block priming"
+        # Garbage in the file must read as "never primed", not crash the loop.
+        write_atomic(PRIME_STAMP_FILE, "not a number", mode=0o600)
+        assert last_prime_at() == float("-inf")
+
     print("selftest ok")
+
+
+def prime_now():
+    """--prime-now: open a five-hour window from the command line.
+
+    Takes the single-instance lock first. Refreshing the token from two
+    processes at once is the one thing that can invalidate the credentials
+    Claude Code owns, so if a daemon is already running this defers to it
+    instead of racing it.
+
+    Deliberately not subject to MIN_PRIME_GAP: someone typing this has decided
+    to spend, and a tool that silently declines is worse than one that obeys.
+    It still records the stamp, so an automatic prime cannot double-spend on
+    top of it within the hour.
+    """
+    if single_instance_lock() is None:
+        raise SystemExit("kclaude-daemon: a daemon is already running; ask it instead:\n"
+                         "  systemctl --user kill -s USR2 kclaude.service")
+    prime_session()
 
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         selftest()
+    elif "--prime-now" in sys.argv:
+        prime_now()
     else:
         main()

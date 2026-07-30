@@ -31,6 +31,7 @@ KCM.SimpleKCM {
     property alias cfg_filePath: filePathField.text
     property alias cfg_refreshOnPopup: refreshPopupCheck.checked
     property alias cfg_autoStartCollector: autoStartCheck.checked
+    property alias cfg_primeOnReset: primeCheck.checked
     property alias cfg_showTooltip: tooltipCheck.checked
     property alias cfg_showResetCountdown: resetCountdownCheck.checked
 
@@ -141,6 +142,24 @@ KCM.SimpleKCM {
             id: filePathField
             Kirigami.FormData.label: page._tr("Usage file:")
             placeholderText: "~/.local/state/kclaude/usage.json"
+        }
+
+        Kirigami.Separator {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: page._tr("Session window")
+        }
+
+        QQC2.CheckBox {
+            id: primeCheck
+            Kirigami.FormData.label: page._tr("On reset:")
+            text: page._tr("Start the next 5-hour window immediately")
+        }
+
+        QQC2.Label {
+            Kirigami.FormData.label: " "
+            text: page._tr("Sends one \"hi\" through the collector when the window resets, so it\nbegins on the clock instead of when you next type something.\nCosts a sliver of the subscription usage it is watching. Never on a refresh.")
+            font: Kirigami.Theme.smallFont
+            opacity: 0.7
         }
 
         QQC2.Label {

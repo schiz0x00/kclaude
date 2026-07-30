@@ -27,6 +27,13 @@
         <entry name="autoStartCollector" type="Bool">
             <default>true</default>
         </entry>
+        <!-- Sends one small message through the collector when the five-hour
+             window resets, so the next one starts then instead of whenever the
+             user happens to type something. Off by default: it spends a little
+             of the usage the widget exists to watch. -->
+        <entry name="primeOnReset" type="Bool">
+            <default>false</default>
+        </entry>
         <entry name="showTooltip" type="Bool">
             <default>true</default>
         </entry>
