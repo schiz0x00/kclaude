@@ -403,7 +403,11 @@ Item {
                 Item { Layout.fillWidth: true }
 
                 PlasmaComponents3.Label {
-                    text: i18n("%1 accounts", root.usageModels.length) // qmllint disable unqualified
+                    readonly property int count: root.usageModels.length
+                    // i18np, not i18n: with one account this said "1 accounts".
+                    // The QML signature is (singular, plural, n) and fills %1 from
+                    // n itself -- passing n again is an excess argument.
+                    text: i18np("%1 account", "%1 accounts", count) // qmllint disable unqualified
                     font: Kirigami.Theme.smallFont
                     opacity: 0.5
                 }
