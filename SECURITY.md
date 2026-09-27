@@ -2,10 +2,18 @@
 
 ## What this project touches
 
-The widget is inert: it reads one JSON file and draws it. The optional collector
+The widget is inert: it reads JSON files and draws them. The optional collector
 daemon is the part with reach. It reads the OAuth token Claude Code stores in
-`~/.claude/.credentials.json`, sends requests to Anthropic with it, and writes a
-refreshed token back to that file when the old one expires.
+each configured account's `.credentials.json` — `~/.claude/.credentials.json`
+unless you add more in the **Accounts** settings page — sends requests to
+Anthropic with them, and writes a refreshed token back to the same file it came
+from when the old one expires. Each account's token only ever goes back to that
+account's own file: writing one account's refresh into another's credentials file
+would log that account out of Claude Code.
+
+The widget also *writes* one file, `~/.config/kclaude/accounts.json`, mode `0600`
+— a list of directory paths and labels. It contains no secrets, and the
+settings dialog never reads a token to produce it.
 
 The README's [Security
 section](README.md#security-read-this-before-installing-the-daemon) is the full
@@ -24,8 +32,8 @@ Please include what an attacker would gain and how to reproduce it. This is a
 hobby project maintained by one person, so expect an initial reply in days
 rather than hours.
 
-Anything that could expose the OAuth token, write a bad token back into
-`~/.claude/.credentials.json`, or send a request the user did not ask for counts
+Anything that could expose an OAuth token, write a bad token back into any
+account's `.credentials.json`, or send a request the user did not ask for counts
 as a vulnerability here — including bugs in the widget half, which is not
 supposed to be able to do any of those things.
 

@@ -93,8 +93,9 @@ echo "Created state directory: $STATE_DIR"
 
 if $INSTALL_DAEMON; then
     echo "Installing daemon..."
-    echo "Note: the daemon reads, and refreshes, the OAuth token in"
-    echo "      ~/.claude/.credentials.json. See the README Security section."
+    echo "Note: the daemon reads, and refreshes, the OAuth token in each"
+    echo "      configured account's .credentials.json (~/.claude by default)."
+    echo "      See the README Security section."
 
     mkdir -p "$HOME/.local/bin"
     cp "$PROJECT_DIR/daemon/kclaude-daemon" "$HOME/.local/bin/kclaude-daemon"
