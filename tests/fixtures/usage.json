@@ -1,0 +1,13 @@
+{
+    "windows": {
+        "five_hour": {
+            "utilization": 0.68,
+            "resetAt": "2099-07-30T18:00:00Z"
+        },
+        "seven_day": {
+            "utilization": 0.41,
+            "resetAt": "2099-08-03T00:00:00Z"
+        }
+    },
+    "updatedAt": "2099-07-30T13:37:00Z"
+}

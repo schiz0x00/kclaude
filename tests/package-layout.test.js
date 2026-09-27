@@ -42,19 +42,35 @@ for (const required of ["metadata.json", "contents/ui/main.qml",
     check(`${required} exists`, fs.existsSync(path.join(repo, required)));
 }
 
-// Every cfg_ alias in the config page must have a matching kcfg entry, and the
+// Every cfg_ alias in a config page must have a matching kcfg entry, and the
 // reverse: Plasma injects one property per key and drops settings that are
-// declared in only one of the two places.
-const page = read(path.join("contents", "ui", sources[0] || "configGeneral.qml"));
-const aliases = new Set([...page.matchAll(/property\s+(?:alias|int|bool|string|real)\s+(cfg_\w+)/g)]
-    .map(m => m[1]));
+// declared in only one of the two places. Checked across every page, not just
+// the first, so a cfg_ added to a second page is held to the same rule.
+const aliases = new Set();
+for (const src of sources) {
+    const page = read(path.join("contents", "ui", src));
+    for (const m of page.matchAll(/property\s+(?:alias|int|bool|string|real)\s+(cfg_\w+)/g)) {
+        aliases.add(m[1]);
+    }
+}
 const entries = new Set([...read("contents/config/main.xml").matchAll(/<entry\s+name="(\w+)"/g)]
     .map(m => "cfg_" + m[1]));
 for (const a of aliases) {
     check(`${a} has a kcfg entry`, entries.has(a), "declared in the form but not in main.xml");
 }
 for (const e of entries) {
-    check(`${e} has a control`, aliases.has(e), "declared in main.xml but not exposed by the form");
+    check(`${e} has a control`, aliases.has(e), "declared in main.xml but not exposed by any form");
+}
+
+// A page that persists state outside main.xml has to do it from save(), or Apply
+// silently does nothing for it. Only the pages that actually write a file are
+// held to this -- a page that is purely cfg_* properties needs no save() at all.
+for (const src of sources) {
+    const page = read(path.join("contents", "ui", src));
+    const writesItsOwnFile = /\bShell\.writeFile\s*\(/.test(page);
+    if (!writesItsOwnFile) continue;
+    check(`${src} defines save()`, /\bfunction\s+save\s*\(/.test(page),
+          "the page writes its own file, so Apply would drop it without save()");
 }
 
 // The icon has to resolve from inside the package. A store install goes through

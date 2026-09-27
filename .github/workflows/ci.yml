@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shell quoting vs a real bash
         run: node tests/shell-quote.test.js
+      - name: Account list rules and the settings page's shell commands
+        run: node tests/accounts.test.js
       - name: Package layout and config wiring
         run: node tests/package-layout.test.js
       - name: Daemon selftest
@@ -42,5 +44,8 @@ jobs:
           export QT_QPA_PLATFORM=offscreen
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_timeutils.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_provider.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_refresh.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_config.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_configaccounts.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_accounts.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_primer.qml

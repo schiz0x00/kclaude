@@ -10,10 +10,77 @@ import "../code/TimeUtils.js" as TimeUtils
 Item {
     id: root
 
-    property var usageModel: null
+    // One entry per configured account. The popup is the only place that shows
+    // all of them at once, which is the point: two accounts have two sets of
+    // windows on two different clocks, and there is no honest way to fold them
+    // into one row.
+    property var usageModels: []
+
     property var collector: null
 
+    // The worst status across accounts, from main.qml.
+    property string aggregateStatus: "unknown"
+
     readonly property string _collectorState: collector ? collector.serviceState : "unknown"
+
+    // A clock, because nothing else here has one.
+    //
+    // TimeUtils.formatResetTime() reads new Date() inside a plain JS function, so
+    // QML cannot see the clock as a binding dependency: every "Resets in ..." in
+    // this file used to be computed once per model update and then frozen until
+    // the next one, which is up to a full refresh interval later. A reset that
+    // had already passed kept counting down at its last value. A binding only
+    // re-evaluates when a dependency changes, so something has to change _now --
+    // and it has to tick at the resolution the text is rendered at, hence 1s
+    // rather than the 10s the coarse "updated" stamp needs.
+    readonly property int _now: nowTick
+
+    // Bumped by the timer below; the bindings below only care that it changed.
+    property int nowTick: 0
+
+    Timer {
+        interval: 1000
+        running: true
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.nowTick++
+    }
+
+    // The account whose numbers get the "Limit resets in ..." line. With one
+    // account that is the account; with several it is the one closest to a limit,
+    // because that is the countdown worth the space.
+    readonly property var _limitingModel: {
+        var worst = null
+        var worstUtil = -1
+        for (var i = 0; i < root.usageModels.length; i++) {
+            var m = root.usageModels[i]
+            var limitId = m.limitingWindow
+            for (var j = 0; j < m.windows.length; j++) {
+                if (m.windows[j].id === limitId && m.windows[j].utilization > worstUtil) {
+                    worstUtil = m.windows[j].utilization
+                    worst = m
+                }
+            }
+        }
+        return worst
+    }
+
+    readonly property var _limitingWindowData: {
+        var model = root._limitingModel
+        if (!model) return null
+        var limitId = model.limitingWindow
+        for (var i = 0; i < model.windows.length; i++) {
+            if (model.windows[i].id === limitId) return model.windows[i]
+        }
+        return null
+    }
+
+    readonly property bool _anyWindows: {
+        for (var i = 0; i < root.usageModels.length; i++) {
+            if (root.usageModels[i].windows.length > 0) return true
+        }
+        return false
+    }
 
     // KLocalizedContext injects i18n at runtime; the linter cannot see it.
     // qmllint disable unqualified
@@ -36,10 +103,28 @@ Item {
                 return i18n("No usage data yet.")
         }
     }
+
+    // "Max" / "Pro" next to the account name, or nothing at all when the file did
+    // not say. Capitalised here rather than in the collector, so a hand-written
+    // usage file that says "max" reads the same as one the collector wrote.
+    function _planLabel(plan) {
+        if (!plan || plan.length === 0) return ""
+        return plan.charAt(0).toUpperCase() + plan.substring(1)
+    }
     // qmllint enable unqualified
 
-    readonly property real _warningThreshold: usageModel ? usageModel.warningThreshold : 0.75
-    readonly property real _criticalThreshold: usageModel ? usageModel.criticalThreshold : 0.9
+    readonly property real _warningThreshold: {
+        for (var i = 0; i < root.usageModels.length; i++) {
+            if (root.usageModels[i]) return root.usageModels[i].warningThreshold
+        }
+        return 0.75
+    }
+    readonly property real _criticalThreshold: {
+        for (var i = 0; i < root.usageModels.length; i++) {
+            if (root.usageModels[i]) return root.usageModels[i].criticalThreshold
+        }
+        return 0.9
+    }
 
     Layout.minimumWidth: Kirigami.Units.gridUnit * 15
     Layout.preferredWidth: Kirigami.Units.gridUnit * 19
@@ -52,16 +137,6 @@ Item {
     Layout.minimumHeight: contentLayout.implicitHeight
     Layout.preferredHeight: contentLayout.implicitHeight
     Layout.maximumHeight: contentLayout.implicitHeight
-
-    readonly property var _limitingWindowData: {
-        var wins = root.usageModel ? root.usageModel.windows : []
-        var limitId = root.usageModel ? root.usageModel.limitingWindow : ""
-        if (!wins || !limitId) return null
-        for (var i = 0; i < wins.length; i++) {
-            if (wins[i].id === limitId) return wins[i]
-        }
-        return null
-    }
 
     PlasmaComponents3.ScrollView {
         id: scrollView
@@ -96,7 +171,7 @@ Item {
                 }
 
                 StatusIndicator {
-                    status: root.usageModel ? root.usageModel.status : "unknown"
+                    status: root.aggregateStatus
                 }
             }
 
@@ -105,25 +180,12 @@ Item {
                 Layout.topMargin: Kirigami.Units.smallSpacing
             }
 
-            // The collector's "only you can fix this" message (expired Claude
-            // Code login). Shown above the bars so it is visible whether or not
-            // there are still numbers to display.
-            PlasmaComponents3.Label {
-                visible: !!(root.usageModel && root.usageModel.dataError)
-                text: root.usageModel ? root.usageModel.dataError : ""
-                textFormat: Text.PlainText
-                wrapMode: Text.WordWrap
-                color: Kirigami.Theme.negativeTextColor
-                Layout.fillWidth: true
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.smallSpacing
-            }
-
-            // Replaces the bars when there is nothing to show, so a stopped or
-            // missing collector is visible instead of a silent empty popup.
+            // Replaces the bars when there is nothing at all to show, so a stopped
+            // or missing collector is visible instead of a silent empty popup. One
+            // account with no data is not enough to hide the others, so this is
+            // only for the case where no account has anything.
             ColumnLayout {
-                visible: !root.usageModel || root.usageModel.windows.length === 0
+                visible: !root._anyWindows
                 Layout.fillWidth: true
                 Layout.margins: Kirigami.Units.largeSpacing
                 spacing: Kirigami.Units.smallSpacing
@@ -150,17 +212,28 @@ Item {
                 }
             }
 
+            // One section per account: its name, its plan, its own bars and its own
+            // countdowns. The two accounts' five-hour windows reset hours apart, so
+            // a single merged list of bars would put two unrelated countdowns under
+            // one heading and read as a single account with six limits.
             Repeater {
-                model: root.usageModel ? root.usageModel.windows : []
+                model: root.usageModels
 
                 delegate: ColumnLayout {
-                    id: windowDelegate
+                    id: accountDelegate
                     required property var modelData
+                    required property int index
+
+                    readonly property bool _isFirst: index === 0
+                    readonly property bool _hasWindows: modelData.windows.length > 0
+                    readonly property bool _showPlan: modelData.plan.length > 0
 
                     Layout.fillWidth: true
                     Layout.leftMargin: Kirigami.Units.largeSpacing
                     Layout.rightMargin: Kirigami.Units.largeSpacing
-                    Layout.topMargin: Kirigami.Units.smallSpacing
+                    Layout.topMargin: _isFirst
+                                     ? Kirigami.Units.smallSpacing
+                                     : Kirigami.Units.largeSpacing
                     spacing: Kirigami.Units.smallSpacing
 
                     RowLayout {
@@ -168,47 +241,141 @@ Item {
                         spacing: Kirigami.Units.smallSpacing
 
                         PlasmaComponents3.Label {
-                            text: windowDelegate.modelData.name
+                            text: accountDelegate.modelData.accountLabel.length > 0 ? accountDelegate.modelData.accountLabel : "kclaude"
                             textFormat: Text.PlainText
                             font.bold: true
                             Layout.fillWidth: true
                             elide: Text.ElideRight
                         }
 
+                        // The plan, in a low-contrast pill. Worth showing because a
+                        // pro account has no Fable window at all, and its absence
+                        // otherwise looks like a bug rather than the plan.
                         PlasmaComponents3.Label {
-                            text: Math.round(windowDelegate.modelData.utilization * 100) + "%"
-                            font.bold: true
-                            color: {
-                                var u = windowDelegate.modelData.utilization
-                                if (u >= root._criticalThreshold) return Kirigami.Theme.negativeTextColor
-                                if (u >= root._warningThreshold) return Kirigami.Theme.neutralTextColor
-                                return Kirigami.Theme.highlightColor
-                            }
+                            visible: accountDelegate._showPlan
+                            text: root._planLabel(accountDelegate.modelData.plan)
+                            textFormat: Text.PlainText
+                            font: Kirigami.Theme.smallFont
+                            opacity: 0.6
+                            Layout.alignment: Qt.AlignVCenter
+                        }
+
+                        StatusIndicator {
+                            status: accountDelegate.modelData.status
                         }
                     }
 
-                    UsageBar {
-                        utilization: windowDelegate.modelData.utilization
-                        warningThreshold: root._warningThreshold
-                        criticalThreshold: root._criticalThreshold
+                    // The collector's "only you can fix this" message (expired
+                    // Claude Code login), per account: a dead login on one of them
+                    // says nothing about the other.
+                    PlasmaComponents3.Label {
+                        visible: accountDelegate.modelData.dataError.length > 0
+                        text: accountDelegate.modelData.dataError
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WordWrap
+                        color: Kirigami.Theme.negativeTextColor
                         Layout.fillWidth: true
                     }
 
                     PlasmaComponents3.Label {
-                        text: i18n("Resets in %1", TimeUtils.formatResetTime(windowDelegate.modelData.resetAt)) // qmllint disable unqualified
+                        visible: !accountDelegate._hasWindows && accountDelegate.modelData.dataError.length === 0
+                        text: i18n("Waiting for usage data...") // qmllint disable unqualified
                         textFormat: Text.PlainText
                         font: Kirigami.Theme.smallFont
                         opacity: 0.6
-                        visible: !!windowDelegate.modelData.resetAt
+                    }
+
+                    Repeater {
+                        model: accountDelegate.modelData.windows
+
+                        delegate: ColumnLayout {
+                            id: windowDelegate
+                            required property var modelData
+
+                            Layout.fillWidth: true
+                            spacing: Kirigami.Units.smallSpacing
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Kirigami.Units.smallSpacing
+
+                                PlasmaComponents3.Label {
+                                    text: windowDelegate.modelData.name
+                                    textFormat: Text.PlainText
+                                    font.bold: true
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                }
+
+                                PlasmaComponents3.Label {
+                                    text: Math.round(windowDelegate.modelData.utilization * 100) + "%"
+                                    font.bold: true
+                                    color: {
+                                        var u = windowDelegate.modelData.utilization
+                                        if (u >= root._criticalThreshold) return Kirigami.Theme.negativeTextColor
+                                        if (u >= root._warningThreshold) return Kirigami.Theme.neutralTextColor
+                                        return Kirigami.Theme.highlightColor
+                                    }
+                                }
+                            }
+
+                            UsageBar {
+                                utilization: windowDelegate.modelData.utilization
+                                warningThreshold: root._warningThreshold
+                                criticalThreshold: root._criticalThreshold
+                                Layout.fillWidth: true
+                            }
+
+                            PlasmaComponents3.Label {
+                                text: {
+                                    // Same clock dependency as the per-window countdown above.
+                                    var tick = root._now
+                                    return i18n("Resets in %1", TimeUtils.formatResetTime(windowDelegate.modelData.resetAt)) // qmllint disable unqualified
+                                }
+                                textFormat: Text.PlainText
+                                font: Kirigami.Theme.smallFont
+                                opacity: 0.6
+                                visible: !!windowDelegate.modelData.resetAt
+                            }
+
+                            // A window the collector refreshes on a rarer cadence than
+                            // the file itself says how old it is, rather than being drawn
+                            // with the same confidence as the one next to it. Most windows
+                            // have no lag at all and never show this.
+                            PlasmaComponents3.Label {
+                                text: {
+                                    var tick = root._now
+                                    var behind = windowDelegate.modelData.behind || 0
+                                    if (behind <= 0) return ""
+                                    return i18n("as of %1", TimeUtils.formatRelativeTime(new Date(Date.now() - behind))) // qmllint disable unqualified
+                                }
+                                textFormat: Text.PlainText
+                                font: Kirigami.Theme.smallFont
+                                opacity: 0.45
+                                visible: (windowDelegate.modelData.behind || 0) > 0
+                            }
+                        }
+                    }
+
+                    PlasmaComponents3.Label {
+                        text: accountDelegate.modelData.lastUpdatedRelative
+                        textFormat: Text.PlainText
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.45
+                        Layout.fillWidth: true
                     }
                 }
             }
 
             PlasmaComponents3.Label {
                 visible: !!Plasmoid.configuration.showResetCountdown && !!root._limitingWindowData
-                text: root._limitingWindowData
-                    ? i18n("Limit resets in %1", TimeUtils.formatResetTime(root._limitingWindowData.resetAt)) // qmllint disable unqualified
-                    : ""
+                text: {
+                    // Same clock dependency as the per-window countdown above.
+                    var tick = root._now
+                    return root._limitingWindowData
+                        ? i18n("Limit resets in %1", TimeUtils.formatResetTime(root._limitingWindowData.resetAt)) // qmllint disable unqualified
+                        : ""
+                }
                 font: Kirigami.Theme.smallFont
                 opacity: 0.6
                 Layout.fillWidth: true
@@ -230,13 +397,13 @@ Item {
                 spacing: Kirigami.Units.smallSpacing
 
                 StatusIndicator {
-                    status: root.usageModel ? root.usageModel.status : "unknown"
+                    status: root.aggregateStatus
                 }
 
                 Item { Layout.fillWidth: true }
 
                 PlasmaComponents3.Label {
-                    text: root.usageModel ? root.usageModel.lastUpdatedRelative : ""
+                    text: i18n("%1 accounts", root.usageModels.length) // qmllint disable unqualified
                     font: Kirigami.Theme.smallFont
                     opacity: 0.5
                 }
@@ -250,14 +417,17 @@ Item {
                 PlasmaComponents3.Button {
                     // Says what it is doing: the file re-read is instant, but the
                     // collector's poll takes a moment, so a plain click would look
-                    // like nothing happened.
+                    // like nothing happened. One click, every account -- the
+                    // collector holds one process and one set of rate limits.
                     text: refreshFeedback.running ? i18n("Refreshing...") : i18n("Refresh") // qmllint disable unqualified
                     icon.name: "view-refresh"
                     Layout.fillWidth: true
                     onClicked: {
                         // Re-read what is on disk now, and ask the collector for
                         // fresh numbers; the file re-read follows a moment later.
-                        if (root.usageModel) root.usageModel.refresh()
+                        for (var i = 0; i < root.usageModels.length; i++) {
+                            root.usageModels[i].refresh()
+                        }
                         if (root.collector) root.collector.requestPoll()
                         refreshFeedback.restart()
                     }
