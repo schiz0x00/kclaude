@@ -63,4 +63,4 @@ fi
 
 echo ""
 echo "Uninstall complete."
-echo "Your Claude Code credentials in ~/.claude/ were not touched."
+echo "Your Claude Code credentials were not touched, in ~/.claude/ or anywhere else."

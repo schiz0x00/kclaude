@@ -1,7 +1,9 @@
 # kclaude
 
 A KDE Plasma 6 panel widget that shows your Claude Code usage limits at a glance:
-the five-hour, weekly and monthly windows, with a colour-coded status dot.
+the five-hour, weekly and monthly windows — plus the Fable weekly budget on
+plans that have one — with a colour-coded status dot, across as many Claude
+accounts as you have logins for.
 
 [![CI](https://github.com/schiz0x00/kclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/schiz0x00/kclaude/actions/workflows/ci.yml)
 [![Packages](https://github.com/schiz0x00/kclaude/actions/workflows/packages.yml/badge.svg)](https://github.com/schiz0x00/kclaude/actions/workflows/packages.yml)
@@ -36,8 +38,15 @@ the five-hour, weekly and monthly windows, with a colour-coded status dot.
 
 - Compact panel indicator with a colour-coded status dot
 - Five-hour, weekly and monthly utilization, each with a progress bar
+- Fable weekly budget, shown automatically on the plans that have one
+- Each account's plan (Max, Pro, …) as a badge, so a plan with no Fable window
+  reads as a plan rather than as a missing bar
+- **Several accounts at once**, each in its own Claude config folder, all
+  polled independently and shown side by side
+- One account's expired login, failed poll or rate-limit backoff never holds up
+  the others
 - Configurable warning and critical thresholds (defaults 75% / 90%)
-- Countdown to the next limit reset
+- Countdown to the next limit reset, ticking in real time
 - Optional background collector that keeps the numbers current
 - Optionally starts the next 5-hour window the moment the previous one resets
 - No runtime dependencies beyond Plasma 6 and Python 3
@@ -60,10 +69,14 @@ says, so none of these needed a real limit to be hit.
 
 ## Security: read this before installing the daemon
 
-The widget alone is inert: it reads one JSON file and draws it. **The optional
-collector daemon is the part that touches your credentials.** Specifically it:
+The widget makes no network calls of its own: it reads one JSON file per
+account and draws them. Its only write is `~/.config/kclaude/accounts.json`, the
+list of which files to read. **The optional collector daemon is the part that
+touches your credentials.** Specifically it:
 
-- Reads the OAuth token Claude Code stores in `~/.claude/.credentials.json`.
+- Reads the OAuth token Claude Code stores in each configured account's
+  `.credentials.json` — `~/.claude/.credentials.json` unless you add more in the
+  **Accounts** settings page.
 - Calls `POST https://api.anthropic.com/v1/messages` with that token once a
   minute — an 8-token Haiku message whose reply is discarded. The usage numbers
   come from the rate-limit headers on the response, which is the only way to get
@@ -74,12 +87,15 @@ collector daemon is the part that touches your credentials.** Specifically it:
   when a ping fails.
 - When the token has expired, refreshes it against
   `https://platform.claude.com/v1/oauth/token` using Claude Code's own OAuth
-  client id, and **writes the refreshed token back to
-  `~/.claude/.credentials.json`** — a file the daemon does not own.
+  client id, and **writes the refreshed token back to that same account's
+  `.credentials.json`** — a file the daemon does not own. Each account's token is
+  only ever written to its own file: there is no module-level path left to reach
+  by accident, because two accounts sharing one credentials file would log each
+  other out of Claude Code on every rotation.
 - Identifies itself as `claude-cli` (user-agent, `x-app`, session-id header),
   since the token and the OAuth client id are Claude Code's either way.
 - If you switch session priming on, one further `POST /v1/messages` per
-  five-hour reset. See
+  five-hour reset, **per account** — each under its own hourly floor. See
   [Starting the next 5-hour window on reset](#starting-the-next-5-hour-window-on-reset).
 
 Consequences worth weighing:
@@ -94,7 +110,11 @@ Consequences worth weighing:
 - **The credential file is shared, not owned.** The daemon re-reads it
   immediately before writing and replaces only the `claudeAiOauth` key, so the
   keys Claude Code owns survive. This narrows the race to microseconds but cannot
-  eliminate it — Claude Code does not take the daemon's lock.
+  eliminate it — Claude Code does not take the daemon's lock. With several
+  accounts there is one such file per account and the same rule applies to each.
+- **The settings dialog never reads a token.** It checks a candidate folder with
+  `test -f` and nothing more, and shows the plan from the collector's own output
+  file, so no OAuth token is ever pulled into the process that draws the dialog.
 - **The collector sends inference requests, not just reads.** Reusing the OAuth
   client id to *ask Claude something* is a bigger imposition than reading a
   usage figure. Every such request draws on the subscription the token belongs
@@ -190,12 +210,73 @@ Right-click the widget → **Configure**:
 | Refresh button | — | Re-reads the file *and* asks the collector to poll now |
 | Warning threshold | 75% | Status turns amber at or above this |
 | Critical threshold | 90% | Status turns red; always kept above the warning level |
-| Usage file path | `~/.local/state/kclaude/usage.json` | |
+| Usage file path | `~/.local/state/kclaude/usage.json` | The **primary** account's file. Every other account's is a `usage-<id>.json` beside it. The **Accounts** page reads this same setting, so a collector of your own works throughout |
 | Refresh on popup open | on | Re-read the file when the popup opens |
 | Start collector on popup open | on | Starts an installed-but-stopped collector. Never installs it |
 | Start the next 5-hour window on reset | **off** | Sends one `hi` through the collector when the window resets. See below |
 | Show tooltip | on | |
 | Show reset countdown | on | |
+
+### Several accounts
+
+Right-click the widget → **Configure** → **Accounts**. Each entry is a Claude
+config directory — the one holding `.claude.json`, as `~/.claude` does — and
+each is polled on its own schedule with its own token, so a login that has
+expired on one leaves the others updating.
+
+- **Scan home folder** finds `~/.claude*` directories for you. **Add folder…**
+  takes any path, and checks for a `.credentials.json` before accepting it.
+- **The label is yours.** It defaults to the folder's own name. Two accounts
+  need to be told apart at a glance, and the credentials do not say which is
+  which: there is no account name or email in that file to read.
+- **Order matters.** The first entry is the primary account, and it is the one
+  that keeps the plain `usage.json` path — so a collector of your own, or an
+  existing setup that reads that file, goes on working untouched. The rest get
+  `usage-<id>.json` beside it.
+- **No restart.** The collector re-reads the list once per poll, so a change
+  takes effect within a minute. Adding an account does not disturb the others'
+  pacing, and removing one does not reset the rest.
+
+The panel shows every account's five-hour window, in order, separated by `·` —
+`82% · 0%` — because one number for "whichever is worst" would leave the panel
+silent about the fact that there is a second account. The popup gives each one a
+section with its own bars, its own plan badge, and its own countdowns: the two
+five-hour windows genuinely reset hours apart, so a single merged list of bars
+would read as one account with six limits.
+
+Removing an account stops it being polled and hides it, and leaves its
+`usage-<id>.json` behind for you to delete — nothing under `~/.claude/` is ever
+touched.
+
+The list lives in `~/.config/kclaude/accounts.json`:
+
+```json
+{
+  "version": 1,
+  "accounts": [
+    { "id": "personal", "label": "Max", "path": "/home/you/.claude" },
+    { "id": "dad",      "label": "Dad", "path": "/home/you/.claude-dad" }
+  ]
+}
+```
+
+You can edit it by hand. A file that is missing, empty or unreadable falls back
+to the single `~/.claude` account this widget has always shown, and a malformed
+entry is dropped with a reason in the journal rather than taking the others down
+with it. Both sides cap the list at 8.
+
+Two paths to know about. The widget writes both out in full — it looks for
+`~/.config/kclaude/accounts.json` and defaults its usage file to
+`~/.local/state/kclaude/usage.json` — while the collector follows
+`XDG_CONFIG_HOME` and `XDG_STATE_HOME`. So on a machine where either variable is
+set, the two halves disagree until you make them agree: set the General page's
+usage file path to `$XDG_STATE_HOME/kclaude/usage.json`, and make the accounts
+list reachable at `~/.config/kclaude/accounts.json` (a symlink is enough). With
+neither variable set, which is the usual case, there is nothing to do.
+
+**The cost scales with the number of accounts.** Each one is pinged every 60 s
+and has its own budget for the scarce usage endpoint, so two accounts cost
+roughly twice one — 8 input tokens and 1 output token of Haiku per minute each.
 
 ### Starting the next 5-hour window on reset
 
@@ -270,17 +351,39 @@ fraction from 0.0 to 1.0, and `resetAt` is an ISO-8601 timestamp:
 {
     "windows": {
         "five_hour": { "utilization": 0.68, "resetAt": "2026-07-30T18:00:00Z" },
-        "seven_day": { "utilization": 0.41, "resetAt": "2026-08-03T00:00:00Z" }
+        "seven_day": { "utilization": 0.41, "resetAt": "2026-08-03T00:00:00Z" },
+        "fable": {
+            "utilization": 0.22,
+            "resetAt": "2026-08-03T00:00:00Z",
+            "updatedAt": "2026-07-30T13:07:00Z"
+        }
     },
-    "updatedAt": "2026-07-30T13:37:00Z"
+    "updatedAt": "2026-07-30T13:37:00Z",
+    "plan": "max"
 }
 ```
+
+An optional top-level `"plan"` is shown as a badge next to the account name. The
+daemon writes it because it is the only thing that reads the credentials, and
+`tests/tst_provider.qml` pins that only `max`, `pro`, `team` and `enterprise` are
+shown — anything else becomes no badge, so a hand-written file cannot put
+arbitrary text on the panel.
+
+With more than one account configured there is one such file per account. The
+first is `usage.json` as above; the rest are `usage-<id>.json` beside it, named
+after the id in `accounts.json`. Each is independent, so a corrupt or missing
+one only affects its own row.
 
 Unknown window keys are accepted and title-cased for display. Malformed entries
 are skipped rather than shown as 0%. An optional top-level `"error"` string is
 shown as a banner in the popup — the daemon uses it when Claude Code's login
 has expired and only the user can fix it. See
 [docs/architecture.md](docs/architecture.md) for the full contract.
+
+A window may carry its own `updatedAt` when the collector reads it less often
+than it writes the file — the popup then says how old that one number is
+instead of presenting it as live. Windows without it are exactly as fresh as
+the file.
 
 ## Daemon
 
@@ -329,7 +432,8 @@ running, rather than risk two processes refreshing the token at once.
 
 ```bash
 node tests/shell-quote.test.js       # shell quoting, checked against a real bash
-node tests/package-layout.test.js   # package layout and config wiring
+node tests/accounts.test.js         # account id/filename rules + the settings page's commands
+node tests/package-layout.test.js    # package layout and config wiring
 python3 daemon/kclaude-daemon --selftest
 qmllint contents/ui/*.qml contents/code/*.qml contents/config/*.qml
 shellcheck scripts/*.sh
@@ -378,7 +482,8 @@ CONTRIBUTING.md               how to build, test and send a patch
 SECURITY.md                   what the daemon touches, and how to report a hole
 contents/
   ui/                         main.qml, compact + full representations, UsageBar, StatusIndicator
-  code/                       UsageModel, FileUsageProvider, ServiceControl, SessionPrimer, Shell.js, TimeUtils.js
+  code/                       UsageModel, FileUsageProvider, AccountList, OneShotReader,
+                              ServiceControl, SessionPrimer, Shell.js, Accounts.js, TimeUtils.js
   config/                     main.xml + the configuration form
   icons/kclaude.svg
 daemon/
@@ -390,12 +495,18 @@ docs/                         architecture, testing, i18n
   screenshots/                every widget state, one PNG each
 tests/
   shell-quote.test.js         shell quoting vs a real bash (node)
+  accounts.test.js            account id/filename rules, and the commands the
+                              accounts page runs (node)
   package-layout.test.js      config page location, cfg wiring, package id (node)
-  tst_config.qml              config page renders and every setting is wired
-  tst_provider.qml            usage.json parsing, incl. the "error" key
+  tst_config.qml              general config page renders, every setting is wired
+  tst_configaccounts.qml      accounts page renders, and the list-editing rules
+  tst_accounts.qml            accounts.json parsing and per-account file paths
+  tst_provider.qml            usage.json parsing, incl. "error" and "plan"
+  tst_refresh.qml             read coalescing and wedge recovery, real engine
   tst_primer.qml              when a new 5-hour window is opened, and when not
   tst_service.qml             collector detection and auto-start
   tst_timeutils.qml           timestamp parsing and formatting
+  fixtures/usage.json         a real file for tst_refresh to point the dataengine at
 .github/workflows/
   ci.yml                      tests and linters, everything except tst_service
   packages.yml                builds the .plasmoid, .deb and .rpm, attaches them to v* tags

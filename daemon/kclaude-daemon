@@ -12,6 +12,7 @@ README: this daemon shares a credential file it does not own.
 import contextlib
 import datetime
 import fcntl
+import io
 import json
 import os
 import random
@@ -25,10 +26,22 @@ import urllib.request
 import uuid
 
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "kclaude")
-USAGE_FILE = os.path.join(STATE_DIR, "usage.json")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "kclaude")
+# Written by the widget's settings page, read here. Absent on every install that
+# predates multiple accounts, which is why load_accounts falls back rather than
+# treating a missing file as "no accounts".
+ACCOUNTS_FILE = os.path.join(CONFIG_DIR, "accounts.json")
 LOCK_FILE = os.path.join(STATE_DIR, "daemon.lock")
+DEFAULT_CONFIG_DIR = os.path.expanduser("~/.claude")
+# The first account's state files, unsuffixed, so an install that already has
+# them keeps reading and writing exactly the same paths. Account derives these
+# same names for index 0 and suffixes the rest.
+USAGE_FILE = os.path.join(STATE_DIR, "usage.json")
+SCOPED_FILE = os.path.join(STATE_DIR, "scoped.json")
 PRIME_STAMP_FILE = os.path.join(STATE_DIR, "last-prime")
-CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
+# Enough for a person with a personal and a work account, and low enough that
+# N accounts cannot turn into N times the ping cost by accident.
+MAX_ACCOUNTS = 8
 
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -113,6 +126,15 @@ RESET_SLACK = 10
 # endpoint returns 429 well below one call every 30s, so this is the floor for
 # manually requested polls, not a nicety.
 MIN_POLL_GAP = 30
+# Fable's weekly budget is the one limit the ping cannot see (see ScopedWindows),
+# so it costs a usage-endpoint call -- the scarce endpoint this daemon otherwise
+# stays off entirely. Measured (2026-09-27) as one call every 65s still answering
+# 200, so half an hour is a wide margin: 48 calls a day, against a budget that
+# the old 5-minute poll drained into a multi-hour 429.
+SCOPED_INTERVAL = 1800
+# Ceiling on that interval's growth. A 429 doubles it; without a cap a bad hour
+# would park Fable's number for a day.
+SCOPED_BACKOFF_MAX = 6 * 3600
 # Priming spends quota, so the floor matters more than it does for a poll. One
 # five-hour window can only need one prime; an hourly ceiling means a widget
 # stuck in a loop costs one tiny message an hour instead of thousands. Kept on
@@ -122,6 +144,11 @@ MIN_PRIME_GAP = 3600
 TOKEN_SKEW_MS = 5 * 60 * 1000
 
 WINDOW_KEYS = ("five_hour", "seven_day", "thirty_day")
+
+
+def iso(epoch):
+    """Unix epoch -> the ISO-8601 form the file contract uses."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
 class AuthError(Exception):
@@ -148,6 +175,192 @@ def write_atomic(path, text, mode=0o644):
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def account_id(raw):
+    """"Claude Dad" -> "claude_dad": the key and filename-safe id for an account.
+
+    Anything that could escape a directory name becomes "_", and a result with
+    nothing usable in it is rejected by the caller rather than defaulted, since
+    two accounts both called "" would collide on every state file they share.
+    """
+    if not isinstance(raw, str):
+        return ""
+    slug = "".join(c if c.isalnum() else "_" for c in raw.strip().lower())
+    return "_".join(part for part in slug.split("_") if part)
+
+
+class Account:
+    """One Claude account: where its credentials live, and the state that is
+    only ever about it.
+
+    Every path an account touches hangs off this object, deliberately. With more
+    than one account configured there is exactly one mistake here that cannot be
+    undone cheaply: refreshing account A's token and writing it into account B's
+    credentials file invalidates B's login, and Claude Code then has to
+    re-authenticate. So there is no module-level credentials path left to reach
+    for by accident -- every reader and writer takes the account it belongs to.
+
+    The first account keeps the historical unsuffixed filenames. An existing
+    install, and anything else already reading usage.json, goes on working
+    without being told about any of this.
+    """
+
+    def __init__(self, spec, index, state_dir=None):
+        self.state_dir = STATE_DIR if state_dir is None else state_dir
+        self.index = index
+        self.id = account_id(spec.get("id")) if isinstance(spec, dict) else ""
+        if isinstance(spec, dict):
+            label = spec.get("label")
+            path = spec.get("path")
+        else:
+            label, path = None, None
+        # The label is only ever shown, so anything unusable falls back to the id
+        # rather than to an empty row in the popup.
+        self.label = str(label).strip() if isinstance(label, str) and label.strip() else self.id
+        # A path is not allowed to default. Falling back to ~/.claude here would
+        # poll someone else's account and file its numbers under this entry's
+        # name, which is the one failure mode a list of accounts must not have --
+        # so an entry without a usable path is marked invalid and dropped by
+        # load_accounts rather than quietly pointed at the default.
+        self.path_ok = isinstance(path, str) and bool(path.strip())
+        self.config_dir = os.path.expanduser(path.strip()) if self.path_ok else DEFAULT_CONFIG_DIR
+        self.credentials_file = os.path.join(self.config_dir, ".credentials.json")
+
+        # Scheduling state, monotonic and per-account. Kept off the object rather
+        # than in the loop's locals because a backoff on one account must not
+        # delay another's poll, and vice versa: an account in a one-hour error
+        # backoff is the one that should wait, not the one that should be stuck
+        # waiting with it.
+        self.next_due = 0.0
+        self.last_poll = 0.0
+        self.wake_floor = 0.0
+        self.backoff = DEFAULT_INTERVAL
+
+        # From the credentials, not from the config file: the plan decides
+        # whether a per-model weekly budget can exist at all, and the user
+        # downgrades without telling the widget.
+        self.plan = ""
+        self.scoped = ScopedWindows(self.state_dir, self)
+        self.suffix_files(index)
+
+    def suffix_files(self, index):
+        """Point this account's state files at its current slot in the list.
+
+        The first account is unsuffixed, so reordering in the settings page
+        moves an account between the historical names and a suffixed one. The
+        file it leaves behind is not renamed or deleted: it is rewritten within a
+        poll interval, and a migration that lands on the wrong path is worse
+        than a stale file that nothing reads any more.
+        """
+        self.index = index
+        suffix = "" if index == 0 else "-" + self.id
+        self.usage_file = os.path.join(self.state_dir, "usage" + suffix + ".json")
+        self.scoped_file = os.path.join(self.state_dir, "scoped" + suffix + ".json")
+        self.prime_stamp_file = os.path.join(self.state_dir, "last-prime" + suffix)
+        self.scoped.set_path(self.scoped_file)
+
+    def __repr__(self):
+        return f"<Account {self.id!r} {self.config_dir}>"
+
+
+def default_account(state_dir=None):
+    """The one account an install has always had: ~/.claude."""
+    return Account({"id": "claude", "label": "claude", "path": DEFAULT_CONFIG_DIR}, 0, state_dir)
+
+
+def load_accounts(state_dir=None):
+    """The configured accounts, in the order the settings page lists them.
+
+    Falls back to the single default account, because a missing accounts.json is
+    what every install that predates this feature looks like, and refusing to
+    start would take the widget down for everyone who has not opened the
+    settings page yet.
+
+    An entry that cannot be used is dropped with a reason in the journal rather
+    than failing the whole list: one bad path must not cost the user the
+    accounts that are fine. An id collision is the one case that cannot be
+    resolved by dropping, since two accounts sharing an id would share every
+    state file, so the later one loses.
+    """
+    try:
+        with open(ACCOUNTS_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return [default_account(state_dir)]
+    except (OSError, ValueError) as e:
+        print(f"kclaude-daemon: {ACCOUNTS_FILE} unreadable ({e}); "
+              f"falling back to {DEFAULT_CONFIG_DIR}", file=sys.stderr)
+        return [default_account(state_dir)]
+
+    entries = data.get("accounts") if isinstance(data, dict) else None
+    if not isinstance(entries, list) or not entries:
+        print(f"kclaude-daemon: {ACCOUNTS_FILE} lists no accounts; "
+              f"falling back to {DEFAULT_CONFIG_DIR}", file=sys.stderr)
+        return [default_account(state_dir)]
+
+    accounts = []
+    seen = set()
+    for entry in entries[:MAX_ACCOUNTS]:
+        if not isinstance(entry, dict):
+            continue
+        account = Account(entry, len(accounts), state_dir)
+        if not account.id:
+            print(f"kclaude-daemon: account {entry!r} has no usable id, skipping", file=sys.stderr)
+            continue
+        if not account.path_ok:
+            # Never defaulted to ~/.claude: see Account.path_ok.
+            print(f"kclaude-daemon: account {entry!r} has no usable path, skipping", file=sys.stderr)
+            continue
+        if account.id in seen:
+            print(f"kclaude-daemon: duplicate account id {account.id!r}, skipping", file=sys.stderr)
+            continue
+        seen.add(account.id)
+        accounts.append(account)
+    if not accounts:
+        print(f"kclaude-daemon: no usable account in {ACCOUNTS_FILE}; "
+              f"falling back to {DEFAULT_CONFIG_DIR}", file=sys.stderr)
+        return [default_account(state_dir)]
+    if len(entries) > MAX_ACCOUNTS:
+        print(f"kclaude-daemon: {len(entries)} accounts configured, using the first {MAX_ACCOUNTS}",
+              file=sys.stderr)
+    return accounts
+
+
+def accounts_signature(accounts):
+    """What the loop compares to notice that the settings page changed something.
+
+    Label included, because a rename should not restart an account's pacing and
+    a path change must, and both arrive as one edited file.
+    """
+    return tuple((a.id, a.config_dir, a.label) for a in accounts)
+
+
+def reconcile_accounts(previous, fresh, state_dir=None):
+    """Fold a reloaded account list into the running objects.
+
+    An account that is still there keeps its object, and with it its backoff,
+    its next-due time and its scoped cache -- a rename or a reordering in the
+    settings page must not reset an hour of error backoff or spend an endpoint
+    call the last poll already earned. Matching is on id and path, so a changed
+    path is deliberately a new account.
+    """
+    by_key = {(a.id, a.config_dir): a for a in previous}
+    merged = []
+    for entry in fresh:
+        old = by_key.get((entry.id, entry.config_dir))
+        if old is not None:
+            old.index = len(merged)
+            old.label = entry.label
+            old.suffix_files(len(merged))
+            merged.append(old)
+        else:
+            merged.append(entry)
+    for gone in previous:
+        if gone not in merged:
+            print(f"kclaude-daemon: account {gone.id!r} removed from the configuration",
+                  file=sys.stderr)
+    return merged
 
 
 def single_instance_lock():
@@ -216,30 +429,36 @@ class Waker:
                 continue
 
 
-def load_credentials():
-    with open(CREDENTIALS_FILE) as f:
+def load_credentials(account):
+    with open(account.credentials_file) as f:
         return json.load(f)
 
 
-def save_oauth(oauth):
-    """Merge the refreshed token back, re-reading the file first.
+def save_oauth(account, oauth):
+    """Merge the refreshed token back into this account's file, re-reading it
+    first.
 
     Claude Code owns this file and updates sibling keys (mcpOAuth,
     organizationUuid) on its own schedule. Re-reading immediately before the
     write shrinks the lost-update window from a whole poll interval to
     microseconds. It cannot close it -- Claude Code does not take our lock -- so
     only the one key we actually changed is written back.
+
+    The file written is the account's, never a shared one. Two accounts
+    refreshing at the same moment are two independent rotations, and a token
+    landing in the wrong credentials file logs the other account out of Claude
+    Code until the user re-authenticates.
     """
     try:
-        creds = load_credentials()
+        creds = load_credentials(account)
     except (OSError, ValueError):
         creds = {}
     creds["claudeAiOauth"] = oauth
     # 0600: the file holds live OAuth tokens.
-    write_atomic(CREDENTIALS_FILE, json.dumps(creds, indent=2), mode=0o600)
+    write_atomic(account.credentials_file, json.dumps(creds, indent=2), mode=0o600)
 
 
-def refresh_access_token(oauth):
+def refresh_access_token(account, oauth):
     """Exchange the refresh token. The server rotates it, so persist at once."""
     body = json.dumps({
         "grant_type": "refresh_token",
@@ -254,14 +473,15 @@ def refresh_access_token(oauth):
         # 400 is what an invalid/rotated-away refresh token actually returns
         # (invalid_grant). 5xx and network errors stay retryable errors.
         if e.code in (400, 401, 403):
-            raise AuthError("Claude Code login expired: run 'claude' and sign in again") from e
+            raise AuthError(f"Claude Code login expired for {account.label}: "
+                            "run 'claude' in that config directory and sign in again") from e
         raise
     oauth["accessToken"] = data["access_token"]
     if "refresh_token" in data:
         oauth["refreshToken"] = data["refresh_token"]
     if "expires_in" in data:
         oauth["expiresAt"] = int(time.time() * 1000) + data["expires_in"] * 1000
-    save_oauth(oauth)
+    save_oauth(account, oauth)
     return oauth["accessToken"]
 
 
@@ -270,6 +490,17 @@ def token_expired(oauth):
     if not isinstance(expires_at, (int, float)):
         return False  # unknown expiry -> let the 401 path handle it
     return time.time() * 1000 >= expires_at - TOKEN_SKEW_MS
+
+
+def read_plan(oauth):
+    """The subscription type out of a credentials blob, or "" if absent.
+
+    Only ever used to skip work that cannot have an answer (see
+    ScopedWindows.refresh) and to label the account in the widget. An
+    unrecognised value is passed through rather than guessed at.
+    """
+    plan = oauth.get("subscriptionType")
+    return plan.strip().lower() if isinstance(plan, str) and plan.strip() else ""
 
 
 def claude_cli_version():
@@ -315,31 +546,36 @@ def fetch_usage(access_token):
         return json.load(resp)
 
 
-def with_token(call):
-    """Run call(access_token), refreshing the token once if it is rejected.
+def with_token(account, call):
+    """Run call(access_token) for one account, refreshing its token once if the
+    server rejects it.
 
     Every authenticated request goes through here, so the refresh-on-401 rule
-    cannot be forgotten by a new caller.
+    cannot be forgotten by a new caller, and so the plan is picked up on the same
+    read that authenticates.
     """
     try:
-        oauth = load_credentials()["claudeAiOauth"]
+        oauth = load_credentials(account)["claudeAiOauth"]
     except FileNotFoundError:
-        raise AuthError("No Claude Code credentials found: run 'claude' and sign in") from None
+        raise AuthError(f"No Claude Code credentials in {account.config_dir}: "
+                        "run 'claude' there and sign in") from None
     except (KeyError, ValueError):
-        raise AuthError("Credentials file has no Claude Code OAuth entry: run 'claude' and sign in") from None
+        raise AuthError(f"{account.config_dir} has no Claude Code OAuth entry: "
+                        "run 'claude' there and sign in") from None
+    account.plan = read_plan(oauth)
     # Refresh up front when the token is known-expired, instead of burning a
     # request to discover it.
-    access_token = refresh_access_token(oauth) if token_expired(oauth) else oauth["accessToken"]
+    access_token = refresh_access_token(account, oauth) if token_expired(oauth) else oauth["accessToken"]
     try:
         return call(access_token)
     except urllib.error.HTTPError as e:
         if e.code != 401:
             raise
-        return call(refresh_access_token(oauth))
+        return call(refresh_access_token(account, oauth))
 
 
-def get_usage():
-    return with_token(fetch_usage)
+def get_usage(account):
+    return with_token(account, fetch_usage)
 
 
 def messages_request(access_token, body, what):
@@ -396,12 +632,12 @@ def usage_from_headers(headers):
             continue
         raw[key] = {
             "utilization": utilization * 100.0,
-            "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset)),
+            "resets_at": iso(reset),
         }
     return raw
 
 
-def ping_usage():
+def ping_usage(account):
     """Read the usage numbers off a ~9-token message instead of the endpoint.
 
     A 429 here means the account is out of quota, and the refusal carries the
@@ -425,7 +661,7 @@ def ping_usage():
                 raise
             return windows
 
-    return with_token(send)
+    return with_token(account, send)
 
 
 def exhausted_until(raw, now=None):
@@ -462,98 +698,318 @@ def exhausted_until(raw, now=None):
 
 
 
-def last_prime_at():
-    """When the last prime went out, as a wall-clock epoch.
+def last_prime_at(account):
+    """When this account's last prime went out, as a wall-clock epoch.
 
-    Wall clock rather than monotonic because this has to survive a restart:
-    an in-memory counter would let a crash-restart loop spend once per crash,
-    which is exactly the case MIN_PRIME_GAP exists to bound.
+    Per account, because the two limits are per account: priming one account
+    must not consume the other's hourly allowance, or a second account would
+    silently never be primed.
+
+    Wall clock rather than monotonic because this has to survive a restart: an
+    in-memory counter would let a crash-restart loop spend once per crash, which
+    is exactly the case MIN_PRIME_GAP exists to bound.
     """
     try:
-        with open(PRIME_STAMP_FILE) as f:
+        with open(account.prime_stamp_file) as f:
             return float(f.read().strip())
     except (OSError, ValueError):
         return float("-inf")
 
 
-def record_prime(when=None):
-    write_atomic(PRIME_STAMP_FILE, str(time.time() if when is None else when), mode=0o600)
+def record_prime(account, when=None):
+    write_atomic(account.prime_stamp_file, str(time.time() if when is None else when), mode=0o600)
 
 
-def prime_gap_elapsed():
-    """True if enough time has passed since the last prime.
+def prime_gap_elapsed(account):
+    """True if enough time has passed since this account's last prime.
 
     A stamp in the future means the clock moved backwards (an NTP step, a
     suspend). Treat that as unknown and allow, rather than locking priming out
     until the clock catches up.
     """
-    since = time.time() - last_prime_at()
+    since = time.time() - last_prime_at(account)
     return not (0 <= since < MIN_PRIME_GAP), since
 
 
-def prime_session():
-    """Send one message, so the five-hour window starts now.
+def prime_session(account):
+    """Send one message, so this account's five-hour window starts now.
 
     Costs a sliver of the quota this daemon exists to watch. That is the trade
     the setting is there to make: the window opens on a schedule the user picked
     instead of whenever they happen to type something.
+
+    Returns (headers, model). The reply's own rate-limit headers are the numbers
+    for the window this call just opened, so the caller gets the fresh state for
+    free instead of spending a second request to ask for it.
     """
     def send(access_token):
         with urllib.request.urlopen(prime_request(access_token), timeout=30) as resp:
-            return json.load(resp)
+            return resp.headers, json.load(resp)
 
-    reply = with_token(send)
+    headers, reply = with_token(account, send)
     # Stamp only once the request came back: a failed prime must not consume the
     # hourly allowance, or one outage would suppress the next real attempt too.
-    record_prime()
+    record_prime(account)
     # The reply is discarded, but its model confirms the request was really
     # served rather than answered from some cache or proxy.
-    print(f"kclaude-daemon: session primed ({reply.get('model', 'unknown model')})", file=sys.stderr)
+    print(f"kclaude-daemon: session primed for {account.label} "
+          f"({reply.get('model', 'unknown model')})", file=sys.stderr)
+    return headers, reply
+
+
+def normalize_window(window):
+    """API percentages (0-100) -> the widget's 0.0-1.0 model, or None.
+
+    None rather than 0.0 for anything unusable, so a window with no real number
+    is dropped rather than drawn as an empty bar that looks like good news.
+    """
+    if not isinstance(window, dict):
+        return None
+    utilization = window.get("utilization")
+    # bool is an int subclass, and utilization: true is not a percentage.
+    if not isinstance(utilization, (int, float)) or isinstance(utilization, bool):
+        return None
+    return {"utilization": utilization / 100.0, "resetAt": window.get("resets_at")}
 
 
 def normalize_windows(raw):
-    """API percentages (0-100) -> the widget's 0.0-1.0 model."""
+    """API shape -> the widget's windows, keeping only the ones we know.
+
+    An allowlist, not everything the response happens to contain: the usage
+    endpoint returns a long tail of sibling keys, some of them real dicts (a
+    0% one at that), and a window the widget invents a name for is worse than a
+    window it leaves out. Scoped limits are added deliberately, by name, in
+    ScopedWindows.apply.
+    """
     windows = {}
     for key in WINDOW_KEYS:
-        window = raw.get(key)
-        if not isinstance(window, dict):
-            continue
-        utilization = window.get("utilization")
-        if not isinstance(utilization, (int, float)):
-            continue
-        windows[key] = {
-            "utilization": utilization / 100.0,
-            "resetAt": window.get("resets_at"),
-        }
+        window = normalize_window(raw.get(key))
+        if window is not None:
+            windows[key] = window
     return windows
 
 
-def write_usage(raw):
+def window_key(name):
+    """"Fable" -> "fable": the window id the file and the widget agree on.
+
+    Empty for anything that is not a name with something in it, so a limit
+    whose scope is malformed is dropped rather than filed under "None".
+    """
+    if not isinstance(name, str):
+        return ""
+    slug = "".join(c if c.isalnum() else "_" for c in name.strip().lower())
+    return "_".join(part for part in slug.split("_") if part)
+
+
+def scoped_windows(payload):
+    """limits[] -> the per-model weekly windows, in the API's own units.
+
+    API shape on purpose, like usage_from_headers, so normalize_windows stays
+    the one place that knows what the widget wants.
+
+    Fable's budget arrives here and nowhere else. It is absent from the
+    anthropic-ratelimit-unified-* headers the ping reads -- verified against a
+    live Max-plan response (2026-09-27), which carried 5h and 7d and nothing
+    else -- so the usage endpoint is the only place this can come from. That is
+    the entire reason ScopedWindows exists.
+
+    The endpoint's shape for one of these:
+
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 22,
+         "resets_at": "2026-09-29T19:59:59.622752+00:00",
+         "scope": {"model": {"id": null, "display_name": "Fable"}}}
+    """
+    limits = payload.get("limits") if isinstance(payload, dict) else None
+    if not isinstance(limits, list):
+        return {}
+    raw = {}
+    for limit in limits:
+        if not isinstance(limit, dict) or limit.get("kind") != "weekly_scoped":
+            continue
+        scope = limit.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        if not isinstance(model, dict):
+            continue
+        key = window_key(model.get("display_name"))
+        percent = limit.get("percent")
+        if key and isinstance(percent, (int, float)) and not isinstance(percent, bool):
+            raw[key] = {"utilization": percent, "resets_at": limit.get("resets_at")}
+    return raw
+
+
+class ScopedWindows:
+    """One account's per-model weekly windows, which only the usage endpoint
+    reports.
+
+    Kept on disk, not just in memory, because the alternative is a daemon that
+    spends an endpoint call on every start -- and a restart loop would turn that
+    into the exact hammering the ping was written to avoid.
+
+    Every entry here is older than the file around it by construction, so each
+    carries its own updatedAt and the widget can say so rather than presenting
+    half-hour-old numbers with the same confidence as the one-minute-old ones.
+
+    Per account, not per process: the endpoint quota is per account, so two
+    accounts have two independent budgets and two independent caches.
+    """
+
+    def __init__(self, path, account=None):
+        self._path = path
+        self._account = account
+        self._windows = {}
+        self._fetched_at = 0.0
+        self._next_attempt = 0.0
+        self._backoff = SCOPED_INTERVAL
+        self._load()
+
+    def set_path(self, path):
+        """Follow the account to a new slot's filename, reloading from it."""
+        if path == self._path:
+            return
+        self._path = path
+        self._windows = {}
+        self._fetched_at = 0.0
+        self._next_attempt = 0.0
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self._path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        windows = data.get("windows")
+        if isinstance(windows, dict):
+            self._windows = windows
+        try:
+            self._fetched_at = float(data.get("fetchedAt"))
+        except (TypeError, ValueError):
+            return
+        # Wall clock, not monotonic, so a restart does not reset the clock and
+        # immediately spend a call the last process already earned the right to
+        # spend.
+        self._next_attempt = self._fetched_at + self._backoff
+
+    def _save(self):
+        write_atomic(self._path, json.dumps(
+            {"windows": self._windows, "fetchedAt": self._fetched_at}, indent=2), mode=0o600)
+
+    def due(self, now=None):
+        return (time.time() if now is None else now) >= self._next_attempt
+
+    def refresh(self, fetch=None):
+        """One endpoint read, if one is due. True if it happened.
+
+        Never raises. This is an extra on top of a poll that already works, and
+        the auth and rate-limit rules belong to the ping loop: duplicating them
+        here would be a second place to get them wrong, and this is the place
+        that must never be the one to hammer the endpoint.
+        """
+        now = time.time()
+        if not self.due(now):
+            return False
+
+        # A plan with no per-model weekly budget cannot answer this, and the
+        # endpoint is the scarce one. Measured (2026-09-27): a pro account
+        # returns limits[] with only session and weekly_all, and scoped_windows
+        # of that is {}. So skip the call rather than spend a scarce call to be
+        # told nothing, and drop any window a downgrade left behind -- otherwise
+        # an account that used to be Max keeps drawing a Fable bar for ever.
+        if self._account is not None and self._account.plan == "pro":
+            if self._windows:
+                self._windows = {}
+                self._fetched_at = now
+                self._save()
+            self._next_attempt = now + self._backoff
+            return False
+
+        try:
+            payload = (get_usage if fetch is None else fetch)(self._account)
+        except Exception as e:
+            self._backoff = min(self._backoff * 2, SCOPED_BACKOFF_MAX)
+            self._next_attempt = now + retry_after(e, self._backoff)
+            label = self._account.label if self._account is not None else "default"
+            print(f"kclaude-daemon: scoped limits unavailable for {label} ({e}); "
+                  f"retrying in {(self._next_attempt - now) / 60:.0f}m", file=sys.stderr)
+            return False
+        windows = scoped_windows(payload)
+        # An empty result is a real answer, not a failure: remembering that is
+        # the point of polling. Losing them would make a plan downgrade leave a
+        # phantom bar forever.
+        self._windows = windows
+        self._fetched_at = now
+        self._backoff = SCOPED_INTERVAL
+        self._next_attempt = now + self._backoff
+        self._save()
+        return True
+
+    def exhausted_until(self, now=None):
+        """The wait for a spent scoped window, or None. See exhausted_until.
+
+        A spent Fable budget refuses the same requests a spent session window
+        does, and the poll cannot see it -- so it has to be considered here or
+        the loop pings into a wall every interval until the week is out.
+        """
+        return exhausted_until(self._windows, now)
+
+    def apply(self, windows):
+        """Merge into a normalized windows dict, in place, and return it.
+
+        A window the poll reports itself is never overwritten: this is the slow
+        path and the fast one is more accurate whenever they disagree.
+        """
+        if not self._windows or not self._fetched_at:
+            return windows
+        stamp = iso(self._fetched_at)
+        for key, raw in self._windows.items():
+            if key in windows:
+                continue
+            window = normalize_window(raw)
+            if window is not None:
+                window["updatedAt"] = stamp
+                windows[key] = window
+        return windows
+
+
+def write_usage(account, raw, scoped=None):
     windows = normalize_windows(raw)
     if not windows:
         raise ValueError(f"no usable windows in response (keys: {sorted(raw)})")
+    if scoped is not None:
+        scoped.apply(windows)
     payload = {
         "windows": windows,
-        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "updatedAt": iso(time.time()),
     }
-    write_atomic(USAGE_FILE, json.dumps(payload, indent=4))
+    # The plan is only knowable from the credentials, which the widget must not
+    # read -- they hold live tokens. So the collector publishes it, and the
+    # widget treats it as optional so a hand-written usage file still works.
+    if account.plan:
+        payload["plan"] = account.plan
+    write_atomic(account.usage_file, json.dumps(payload, indent=4))
 
 
-def write_error(message):
-    """Put an auth problem in usage.json without discarding the last good
-    numbers: the widget keeps showing them (as stale) alongside the message.
-    A successful poll rewrites the file without the key, clearing it."""
+def write_error(account, message):
+    """Put an auth problem in this account's usage.json without discarding the
+    last good numbers: the widget keeps showing them (as stale) alongside the
+    message. A successful poll rewrites the file without the key, clearing it.
+
+    Scoped to the account that failed, so one dead login cannot blank out the
+    other account's numbers.
+    """
     try:
-        with open(USAGE_FILE) as f:
+        with open(account.usage_file) as f:
             payload = json.load(f)
         if not isinstance(payload, dict):
             payload = {}
     except (OSError, ValueError):
         payload = {}
     payload.setdefault("windows", {})
-    payload.setdefault("updatedAt", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    payload.setdefault("updatedAt", iso(time.time()))
     payload["error"] = message
-    write_atomic(USAGE_FILE, json.dumps(payload, indent=4))
+    write_atomic(account.usage_file, json.dumps(payload, indent=4))
 
 
 def retry_after(error, fallback):
@@ -565,15 +1021,16 @@ def retry_after(error, fallback):
         return fallback
 
 
-def collect():
-    """One round of numbers: the ping, with the usage endpoint as the fallback.
+def collect(account):
+    """One round of numbers for one account: the ping, with the usage endpoint as
+    the fallback.
 
     The endpoint stays reachable for the cases the headers do not cover -- a
     retired ping model, a window key this account has that the headers do not
     report -- but it is no longer on the hot path, which is the whole point.
     """
     try:
-        windows = ping_usage()
+        windows = ping_usage(account)
         if windows:
             return windows
         # A 200 with no rate-limit headers on it. Not an error, and that is the
@@ -584,8 +1041,9 @@ def collect():
         raise
     except Exception as e:
         reason = f"ping failed ({e})"
-    print(f"kclaude-daemon: {reason}, falling back to the usage endpoint", file=sys.stderr)
-    return get_usage()
+    print(f"kclaude-daemon: {account.label}: {reason}, falling back to the usage endpoint",
+          file=sys.stderr)
+    return get_usage(account)
 
 
 def parse_interval(argv):
@@ -597,6 +1055,151 @@ def parse_interval(argv):
         raise SystemExit(f"kclaude-daemon: interval must be a whole number of seconds, got {argv[1]!r}")
 
 
+def poll_account(account, interval):
+    """One poll of one account. Sets its next_due and wake_floor. Never raises.
+
+    Failure is contained here rather than around the loop, because one account's
+    dead login must not stop the other one updating: a panel that silently
+    freezes a working account because a second one needs re-authenticating is
+    worse than one row saying what is wrong.
+    """
+    now = time.monotonic()
+    account.last_poll = now
+    delay = interval
+    try:
+        # Due-checked, so this costs nothing on the poll cadence it does not
+        # serve; see SCOPED_INTERVAL for why it is as slow as it is.
+        account.scoped.refresh()
+        raw = collect(account)
+        write_usage(account, raw, account.scoped)
+        account.backoff = interval
+        spent = exhausted_until(raw)
+        # The poll only reports the windows it can see. A spent Fable budget
+        # refuses the request just as hard, and the daemon has to go quiet for
+        # that too or it spends the day pinging a wall.
+        if spent is None:
+            spent = account.scoped.exhausted_until()
+        delay = interval if spent is None else spent
+        # Out of quota is not a pace to nudge: a Refresh click cannot buy a
+        # number the server will not give, so the wait is the floor too.
+        account.wake_floor = MIN_POLL_GAP if spent is None else delay
+        if spent is not None:
+            print(f"kclaude-daemon: {account.label}: limit reached, quiet for {spent / 60:.0f}m "
+                  "until the window resets", file=sys.stderr)
+    except AuthError as e:
+        print(f"kclaude-daemon: {e}", file=sys.stderr)
+        write_error(account, str(e))
+        delay = account.backoff
+        account.backoff = min(account.backoff * 2, MAX_BACKOFF)
+        # The user's next move is re-authenticating and hitting Refresh, so
+        # unlike the generic backoff below, let a manual poll through at the
+        # normal pace. If they have not re-authed yet it costs one token
+        # request per click, floored at MIN_POLL_GAP.
+        account.wake_floor = MIN_POLL_GAP
+    except Exception as e:
+        print(f"kclaude-daemon: {account.label}: {e}", file=sys.stderr)
+        # Exponential backoff so a rate limit or an outage is not hammered.
+        delay = retry_after(e, account.backoff)
+        account.backoff = min(account.backoff * 2, MAX_BACKOFF)
+        # While backing off, a refresh request must not short-circuit the wait:
+        # that is exactly how one 429 becomes a hammer.
+        account.wake_floor = delay
+    account.next_due = now + delay
+
+
+def seconds_until_next(accounts):
+    """How long until the most urgent account is due. Never negative.
+
+    The minimum across accounts, not one shared interval: an account sitting in
+    an hour of error backoff must not hold the others at that cadence, and a
+    limit that resets in four minutes must not be polled at the slowest
+    account's pace.
+    """
+    now = time.monotonic()
+    return max(1.0, min(a.next_due for a in accounts) - now)
+
+
+def request_poll(accounts):
+    """Bring every account forward to the earliest a signal is allowed to.
+
+    The floor is the account's own wake_floor, not zero: a refresh must not
+    become a way around the pacing a 429 or a spent limit is enforcing, and
+    during an error backoff that floor is the whole backoff, so no signal can
+    short-circuit it.
+    """
+    for account in accounts:
+        account.next_due = min(account.next_due, account.last_poll + account.wake_floor)
+    print("kclaude-daemon: poll requested", file=sys.stderr)
+
+
+def prime_due_accounts(accounts):
+    """Open the next five-hour window for every account that has run out.
+
+    One signal covers all of them: the widget cannot say which account's clock
+    ran out, and picking one would leave the others to be primed by hand. Each
+    account is rate-limited by its own stamp, so this costs one tiny message per
+    account per window and the accounts stay independent.
+    """
+    for account in accounts:
+        elapsed, since = prime_gap_elapsed(account)
+        if not elapsed:
+            print(f"kclaude-daemon: prime requested, refused for {account.label}: only "
+                  f"{since / 60:.0f}m since the last one", file=sys.stderr)
+            continue
+        try:
+            headers, _reply = prime_session(account)
+            # The prime's own reply carries the rate-limit headers for the window
+            # it just opened, so the numbers update for free rather than costing
+            # a second request. Some response can arrive without them; then fall
+            # back to a real poll.
+            fresh = usage_from_headers(headers)
+            write_usage(account, fresh if fresh else collect(account), account.scoped)
+            # The prime is what un-exhausted the window: the quiesce and the error
+            # backoff were both derived from numbers that no longer hold. Waiting
+            # out the rest of a sleep a prime has just made obsolete is how the
+            # file sat frozen at 100% for up to five hours after the window had
+            # already reopened.
+            account.wake_floor = 0.0
+            account.next_due = time.monotonic()
+        except AuthError as e:
+            # The prime itself may be the thing that found the login dead. Say so,
+            # and leave the account's own error handling to the poll at the top of
+            # the loop.
+            print(f"kclaude-daemon: prime failed for {account.label}: {e}", file=sys.stderr)
+        except Exception as e:
+            # A failed prime must not disturb the poll loop: the widget keeps
+            # working, and the reason is in the journal. The schedule stays as it
+            # was, since nothing proved it obsolete.
+            print(f"kclaude-daemon: prime failed for {account.label}: {e}", file=sys.stderr)
+
+
+def reload_accounts(accounts):
+    """Pick up an edited accounts.json without a restart.
+
+    The settings page writes the whole list on Apply, so the file is re-read once
+    per loop iteration and compared. Accounts that are still there keep their
+    pacing and their scoped cache; only genuinely new ones start cold.
+
+    Reloaded against the state directory the running accounts were built with,
+    not whatever the module global currently says: a reload that quietly moved
+    every account's state files would strand the numbers the widget is reading.
+    """
+    state_dir = accounts[0].state_dir if accounts else None
+    fresh = load_accounts(state_dir)
+    if accounts_signature(fresh) == accounts_signature(accounts):
+        return accounts
+    print("kclaude-daemon: account configuration changed, reloading", file=sys.stderr)
+    known = {id(a) for a in accounts}
+    merged = reconcile_accounts(accounts, fresh)
+    for account in merged:
+        # Only new ones are worth announcing: a rename or a reorder keeps the same
+        # objects, and re-listing them every pass would bury a real change.
+        if id(account) not in known:
+            print(f"kclaude-daemon: now watching {account.label!r} at {account.config_dir} "
+                  f"-> {account.usage_file}", file=sys.stderr)
+    return merged
+
+
 def main():
     interval = parse_interval(sys.argv)
     if single_instance_lock() is None:
@@ -605,80 +1208,42 @@ def main():
         print("kclaude-daemon: another instance is already running, exiting", file=sys.stderr)
         return
     waker = Waker()
-    backoff = interval
-    last_poll = 0.0
+    accounts = load_accounts()
+    for account in accounts:
+        print(f"kclaude-daemon: watching {account.label!r} at {account.config_dir} "
+              f"-> {account.usage_file}", file=sys.stderr)
     while True:
-        last_poll = time.monotonic()
-        try:
-            raw = collect()
-            write_usage(raw)
-            backoff = interval
-            spent = exhausted_until(raw)
-            delay = interval if spent is None else spent
-            # Out of quota is not a pace to nudge: a Refresh click cannot buy a
-            # number the server will not give, so the wait is the floor too.
-            wake_floor = MIN_POLL_GAP if spent is None else delay
-            if spent is not None:
-                print(f"kclaude-daemon: limit reached, quiet for {spent / 60:.0f}m "
-                      "until the window resets", file=sys.stderr)
-        except AuthError as e:
-            print(f"kclaude-daemon: {e}", file=sys.stderr)
-            write_error(str(e))
-            delay = backoff
-            backoff = min(backoff * 2, MAX_BACKOFF)
-            # The user's next move is re-authenticating and hitting Refresh, so
-            # unlike the generic backoff below, let a manual poll through at the
-            # normal pace. If they have not re-authed yet it costs one token
-            # request per click, floored at MIN_POLL_GAP.
-            wake_floor = MIN_POLL_GAP
-        except Exception as e:
-            print(f"kclaude-daemon: {e}", file=sys.stderr)
-            # Exponential backoff so a rate limit or an outage is not hammered.
-            delay = retry_after(e, backoff)
-            backoff = min(backoff * 2, MAX_BACKOFF)
-            # While backing off, a refresh request must not short-circuit the
-            # wait: that is exactly how one 429 becomes a hammer.
-            wake_floor = delay
+        accounts = reload_accounts(accounts)
+        now = time.monotonic()
+        for account in accounts:
+            # Per account rather than one shared cadence, so a fresh account is
+            # picked up on the next pass and a backed-off one is simply skipped.
+            if now >= account.next_due:
+                poll_account(account, interval)
         # Jitter avoids lockstep retries across restarts.
-        woke = waker.wait(delay + random.uniform(0, min(15, delay * 0.1)))
+        woke = waker.wait(seconds_until_next(accounts) + random.uniform(0, 15))
 
         if signal.SIGUSR2 in woke:
-            # The widget saw the five-hour window run out and wants the next one
+            # The widget saw a five-hour window run out and wants the next one
             # opened now.
-            elapsed, since_prime = prime_gap_elapsed()
-            if not elapsed:
-                print(f"kclaude-daemon: prime requested, refused: only "
-                      f"{since_prime / 60:.0f}m since the last one", file=sys.stderr)
-            else:
-                try:
-                    prime_session()
-                except Exception as e:
-                    # A failed prime must not disturb the poll loop: the widget
-                    # keeps working, and the reason is in the journal.
-                    print(f"kclaude-daemon: prime failed: {e}", file=sys.stderr)
-
+            prime_due_accounts(accounts)
         if signal.SIGUSR1 in woke:
-            # A manual refresh that did nothing is worth being able to see.
-            print("kclaude-daemon: poll requested", file=sys.stderr)
-
-        # Every branch above falls through to the top of the loop, which polls
-        # straight away -- so the floor belongs here, once, rather than in the
-        # branch that happens to have remembered it. A prime that was refused or
-        # that failed must not become a way around the pacing a refresh gets, and
-        # during an error backoff wake_floor is the whole backoff, so no signal
-        # can short-circuit it. A prime that succeeded lands here too: the
-        # numbers on screen are stale until the next poll, but the poll that
-        # opened this wait can be seconds old, and that is exactly how an
-        # immediate re-poll earns a 429 and doubles the backoff for no reason.
-        if woke:
-            since = time.monotonic() - last_poll
-            if since < wake_floor:
-                print(f"kclaude-daemon: pacing {wake_floor - since:.0f}s", file=sys.stderr)
-                time.sleep(wake_floor - since)
+            request_poll(accounts)
 
 
 def selftest():
-    global CREDENTIALS_FILE, STATE_DIR, LOCK_FILE, PRIME_STAMP_FILE, CLAUDE_VERSIONS_DIR
+    global STATE_DIR, LOCK_FILE, ACCOUNTS_FILE, CLAUDE_VERSIONS_DIR
+
+    @contextlib.contextmanager
+    def quiet():
+        """Swallow the collector's own journal output for the duration.
+
+        Several cases below drive reload and scheduling paths that log on every
+        call, and the point of the selftest is the last line, not the noise in
+        front of it.
+        """
+        with contextlib.redirect_stderr(io.StringIO()) as buf:
+            yield buf
 
     assert normalize_windows({"five_hour": {"utilization": 68, "resets_at": "T"}}) == {
         "five_hour": {"utilization": 0.68, "resetAt": "T"}
@@ -762,28 +1327,197 @@ def selftest():
     assert usage_from_headers({}) == {}
     assert usage_from_headers({"anthropic-ratelimit-unified-5h-utilization": "0.5"}) == {}
 
+    # The one that motivated generic handling: a boolean is an int in Python, and
+    # utilization: true must not become 1%.
+    assert normalize_window({"utilization": True}) is None
+    assert normalize_window({"utilization": 50}) == {"utilization": 0.5, "resetAt": None}
+    assert normalize_window(None) is None
+    assert normalize_window({"utilization": "50"}) is None
+
+    # Fable's weekly budget rides on limits[] and on nothing else. This is the
+    # live shape from a Max-plan account (2026-09-27), trimmed to the fields the
+    # reader uses.
+    scoped_payload = {"limits": [
+        {"kind": "session", "group": "session", "percent": 82,
+         "resets_at": "2026-09-27T16:29:59.622488+00:00", "scope": None},
+        {"kind": "weekly_all", "group": "weekly", "percent": 11,
+         "resets_at": "2026-09-29T19:59:59.622513+00:00", "scope": None},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 22,
+         "resets_at": "2026-09-29T19:59:59.622752+00:00",
+         "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+    ]}
+    assert scoped_windows(scoped_payload) == {
+        "fable": {"utilization": 22, "resets_at": "2026-09-29T19:59:59.622752+00:00"}
+    }
+    # An account without Fable reports no scoped limit at all, and that has to
+    # read as "none" rather than as a parse failure.
+    assert scoped_windows({"limits": scoped_payload["limits"][:2]}) == {}
+    assert scoped_windows({}) == {}
+    assert scoped_windows({"limits": None}) == {}
+    assert scoped_windows(None) == {}
+    # A scoped limit with nothing usable in it, or no model to name it after, is
+    # dropped rather than shown as a nameless or unmeasured bar.
+    assert scoped_windows({"limits": [
+        {"kind": "weekly_scoped", "percent": 10, "resets_at": "T", "scope": None}]}) == {}
+    assert scoped_windows({"limits": [
+        {"kind": "weekly_scoped", "percent": 10, "resets_at": "T", "scope": {}}]}) == {}
+    assert scoped_windows({"limits": [
+        {"kind": "weekly_scoped", "percent": 10, "resets_at": "T",
+         "scope": {"model": {}}}]}) == {}
+    assert scoped_windows({"limits": [
+        {"kind": "weekly_scoped", "percent": 10, "resets_at": "T",
+         "scope": {"model": {"display_name": "   "}}}]}) == {}
+    assert scoped_windows({"limits": [
+        {"kind": "weekly_scoped", "resets_at": "T",
+         "scope": {"model": {"display_name": "Fable"}}}]}) == {}
+    # A different kind of limit is not this function's business.
+    assert scoped_windows({"limits": [
+        {"kind": "weekly_all", "percent": 10, "resets_at": "T", "scope": None}]}) == {}
+    # Any other model family keeps working: the id is derived, not enumerated,
+    # so a second scoped limit needs no code change here.
+    assert list(scoped_windows({"limits": [
+        {"kind": "weekly_scoped", "percent": 5, "resets_at": "T",
+         "scope": {"model": {"display_name": "Opus 4.6"}}}]})) == ["opus_4_6"]
+    # The endpoint's long tail of sibling keys must not leak into the file as
+    # windows: normalize_windows is an allowlist, deliberately.
+    assert set(normalize_windows({
+        "five_hour": {"utilization": 82, "resets_at": "T"},
+        "nimbus_quill": {"utilization": 0, "resets_at": None},
+        "seven_day_opus": None,
+    })) == {"five_hour"}
+
+    # The scoped cache, end to end against a real file.
+    with tempfile.TemporaryDirectory() as d:
+        sc_path = os.path.join(d, "scoped.json")
+        now = time.time()
+
+        calls = []
+        def fake_fetch(_account):
+            calls.append(1)
+            return scoped_payload
+        # No account attached: this block is about the cache itself, and an
+        # account is what carries the plan the skip below keys off.
+        sc = ScopedWindows(sc_path)
+        # Cold: no window yet, and one due because nothing has been fetched.
+        assert not sc._windows
+        assert sc.due(now)
+        assert sc.refresh(fake_fetch)
+        assert len(calls) == 1
+        assert not sc.due(now), "one call must not buy a second one"
+        assert not sc.refresh(fake_fetch)
+        assert len(calls) == 1, "not due -> no request at all"
+
+        # The merge keeps its own timestamp, because it really is older, and
+        # never displaces a window the poll reports itself.
+        polled = normalize_windows({"five_hour": {"utilization": 82, "resets_at": "P"},
+                                    "fable": {"utilization": 99, "resets_at": "Q"}})
+        merged = sc.apply(polled)
+        assert set(merged) == {"five_hour", "fable"}
+        assert merged["five_hour"] == {"utilization": 0.82, "resetAt": "P"}
+        assert "updatedAt" not in merged["five_hour"]
+        assert merged["fable"] == {"utilization": 0.22,
+                                   "resetAt": "2026-09-29T19:59:59.622752+00:00",
+                                   "updatedAt": iso(sc._fetched_at)}
+        assert sc.apply({})["fable"]["utilization"] == 0.22
+
+        # A spent Fable budget is invisible to the poll and refuses the same
+        # requests, so it has to quiet the daemon on its own.
+        assert sc.exhausted_until(time.time()) is None
+        sc._windows = {"fable": {"utilization": 100,
+                                 "resets_at": "2026-09-29T19:59:59.622752+00:00"}}
+        # 6-digit fractional seconds and a +00:00 offset: the endpoint's own
+        # shape. The point of the bound is that the answer is the real wait and
+        # not the MAX_BACKOFF fallback -- a fromisoformat that could not read
+        # this shape would return exactly MAX_BACKOFF, and the daemon would then
+        # poll a spent weekly budget once an hour instead of waiting it out.
+        spent_fable = sc.exhausted_until(
+            datetime.datetime.fromisoformat("2026-09-29T19:00:00+00:00").timestamp())
+        assert MAX_BACKOFF < spent_fable < MAX_BACKOFF + 60, spent_fable
+        sc._windows = {"fable": {"utilization": 99.9, "resets_at": "T"}}
+        assert sc.exhausted_until(time.time()) is None
+        sc._windows = {"fable": {"utilization": 22,
+                                 "resets_at": "2026-09-29T19:59:59.622752+00:00"}}
+
+        # Persisted, so a restart does not spend a call the last one earned.
+        revived = ScopedWindows(sc_path)
+        assert revived._windows == sc._windows
+        assert revived._fetched_at == sc._fetched_at
+        assert not revived.due(now)
+        assert revived.apply({})["fable"]["utilization"] == 0.22
+
+        # A failure backs off instead of retrying into the wall, and never
+        # raises into the poll loop. Each clock is snapshotted: reading
+        # sc._next_attempt live would always answer "due".
+        real_now = time.time
+        try:
+            boundary = sc._next_attempt
+            time.time = lambda: boundary
+            assert sc.due(), "due exactly at the boundary"
+            assert not sc.refresh(lambda _a: (_ for _ in ()).throw(RuntimeError("429")))
+            assert len(calls) == 1, "a failed refresh must not retry inline"
+            assert not sc.due(), "a failure must push the next attempt out"
+            # Doubled, so it takes two intervals before the next try.
+            assert sc._next_attempt >= boundary + SCOPED_INTERVAL
+            retry_at = sc._next_attempt
+            time.time = lambda: retry_at
+            assert sc.due()
+            assert sc.refresh(fake_fetch)
+            assert len(calls) == 2
+            assert not sc.due(), "a success resets the interval, it does not reset the clock"
+        finally:
+            time.time = real_now
+
+        # A plan downgrade: the endpoint stops reporting the window, and the
+        # phantom has to go rather than sit on the panel forever.
+        downgrade_at = sc._next_attempt
+        time.time = lambda: downgrade_at
+        assert sc.refresh(lambda _a: {"limits": []})
+        assert sc._windows == {}
+        assert sc.apply(normalize_windows({"five_hour": {"utilization": 1, "resets_at": "T"}})) \
+            == {"five_hour": {"utilization": 0.01, "resetAt": "T"}}
+
+        # Garbage on disk reads as "never fetched", not as a crash.
+        write_atomic(sc_path, "not json", mode=0o600)
+        assert ScopedWindows(sc_path)._windows == {}
+        write_atomic(sc_path, json.dumps({"windows": {}, "fetchedAt": "soon"}), mode=0o600)
+        assert ScopedWindows(sc_path)._fetched_at == 0.0
+        assert os.stat(sc_path).st_mode & 0o777 == 0o600
+
+    # prime_session hands back the headers its own reply carried, so opening a
+    # window can update the numbers without spending a second request. What has
+    # to hold is that the reply's headers read as a normal poll.
+    class FakeReply:
+        headers = {"anthropic-ratelimit-unified-5h-utilization": "0.5",
+                   "anthropic-ratelimit-unified-5h-reset": "1785388800"}
+    # API shape out, exactly as a real reply's headers read, so what main() gets
+    # back from a prime needs no special handling.
+    assert usage_from_headers(FakeReply.headers) == {
+        "five_hour": {"utilization": 50.0, "resets_at": "2026-07-30T05:20:00Z"}}
+
     # The fallback ladder. The second case is the one worth a test: a 200 with
     # no headers raises nothing, so without the check collect() would hand
     # write_usage an empty dict and the daemon would back off forever.
     global ping_usage, get_usage
     real_ping, real_endpoint = ping_usage, get_usage
     endpoint_calls = []
-    get_usage = lambda: (endpoint_calls.append(1), {"five_hour": {"utilization": 5, "resets_at": "T"}})[1]
+    any_account = default_account()
+    get_usage = lambda _a: (endpoint_calls.append(1),
+                            {"five_hour": {"utilization": 5, "resets_at": "T"}})[1]
     try:
-        ping_usage = lambda: {"five_hour": {"utilization": 70, "resets_at": "T"}}
-        assert collect()["five_hour"]["utilization"] == 70  # ping wins
+        ping_usage = lambda _a: {"five_hour": {"utilization": 70, "resets_at": "T"}}
+        assert collect(any_account)["five_hour"]["utilization"] == 70  # ping wins
         assert not endpoint_calls
-        ping_usage = lambda: {}  # 200, but the headers are gone
-        assert collect()["five_hour"]["utilization"] == 5
-        def boom():
+        ping_usage = lambda _a: {}  # 200, but the headers are gone
+        assert collect(any_account)["five_hour"]["utilization"] == 5
+        def boom(_a):
             raise RuntimeError("model retired")
         ping_usage = boom
-        assert collect()["five_hour"]["utilization"] == 5
-        def expired():
+        assert collect(any_account)["five_hour"]["utilization"] == 5
+        def expired(_a):
             raise AuthError("login expired")
         ping_usage = expired
         try:
-            collect()
+            collect(any_account)
             raise SystemExit("selftest: an expired login must not fall back")
         except AuthError:
             pass
@@ -829,15 +1563,16 @@ def selftest():
     # The file format is the contract with FileUsageProvider.qml, which reads
     # windows[*].utilization, windows[*].resetAt and updatedAt. Changing a key
     # here silently blanks the widget, so pin the shape.
-    global USAGE_FILE
     with tempfile.TemporaryDirectory() as d:
-        USAGE_FILE = os.path.join(d, "usage.json")
-        write_usage({
+        acct = Account({"id": "solo", "label": "Solo", "path": os.path.join(d, "cfg")}, 0, d)
+        acct.plan = "max"
+        write_usage(acct, {
             "five_hour": {"utilization": 68, "resets_at": "2026-07-30T18:00:00Z"},
             "seven_day": {"utilization": 41.5, "resets_at": "2026-08-03T00:00:00Z"},
         })
-        written = json.load(open(USAGE_FILE))
-        assert set(written) == {"windows", "updatedAt"}, written
+        written = json.load(open(acct.usage_file))
+        assert set(written) == {"windows", "updatedAt", "plan"}, written
+        assert written["plan"] == "max"
         assert set(written["windows"]) == {"five_hour", "seven_day"}, written
         for w in written["windows"].values():
             assert set(w) == {"utilization", "resetAt"}, w
@@ -846,20 +1581,41 @@ def selftest():
         assert written["updatedAt"].endswith("Z")
 
         # An auth error lands in the file without clobbering the numbers...
-        write_error("re-auth me")
-        after_err = json.load(open(USAGE_FILE))
+        write_error(acct, "re-auth me")
+        after_err = json.load(open(acct.usage_file))
         assert after_err["error"] == "re-auth me", after_err
         assert set(after_err["windows"]) == {"five_hour", "seven_day"}, after_err
         # ...and the next successful poll clears it (pinned by the exact-keys
         # assertion above too, but say it explicitly).
-        write_usage({"five_hour": {"utilization": 10, "resets_at": "T"}})
-        assert "error" not in json.load(open(USAGE_FILE))
+        write_usage(acct, {"five_hour": {"utilization": 10, "resets_at": "T"}})
+        assert "error" not in json.load(open(acct.usage_file))
         # No prior file: the error-only payload still has the contract keys.
-        USAGE_FILE = os.path.join(d, "fresh", "usage.json")
-        write_error("no creds")
-        fresh = json.load(open(USAGE_FILE))
+        bare = Account({"id": "bare", "path": os.path.join(d, "cfg2")}, 0, os.path.join(d, "fresh"))
+        write_error(bare, "no creds")
+        fresh = json.load(open(bare.usage_file))
         assert set(fresh) == {"windows", "updatedAt", "error"}, fresh
         assert fresh["windows"] == {}
+        # An account whose plan is not known writes no plan key at all, so a
+        # hand-written or pre-plan file keeps parsing.
+        assert "plan" not in json.load(open(bare.usage_file))
+
+        # With a scoped window in the mix, the file gains exactly one key on
+        # exactly one window, and the file-level updatedAt is untouched by it.
+        scoped_acct = Account({"id": "scoped", "path": os.path.join(d, "cfg3")}, 0, d)
+        sc = ScopedWindows(scoped_acct.scoped_file, scoped_acct)
+        sc.refresh(lambda _a: {"limits": [
+            {"kind": "weekly_scoped", "percent": 22, "resets_at": "2026-09-29T19:59:59Z",
+             "scope": {"model": {"display_name": "Fable"}}}]})
+        write_usage(scoped_acct, {"five_hour": {"utilization": 82, "resets_at": "2026-09-27T16:29:59Z"}}, sc)
+        merged = json.load(open(scoped_acct.usage_file))
+        assert set(merged) == {"windows", "updatedAt"}, merged
+        assert set(merged["windows"]) == {"five_hour", "fable"}, merged
+        assert set(merged["windows"]["five_hour"]) == {"utilization", "resetAt"}
+        assert set(merged["windows"]["fable"]) == {"utilization", "resetAt", "updatedAt"}
+        assert merged["windows"]["fable"]["utilization"] == 0.22
+        assert merged["windows"]["fable"]["updatedAt"].endswith("Z")
+        # The slower window's own age, so the widget never presents it as live.
+        assert merged["windows"]["fable"]["updatedAt"] <= merged["updatedAt"]
 
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "sub", "usage.json")
@@ -869,41 +1625,61 @@ def selftest():
         assert not [n for n in os.listdir(os.path.dirname(p)) if n.startswith(".tmp-")]
 
         # save_oauth must not drop the keys Claude Code owns.
-        CREDENTIALS_FILE = os.path.join(d, ".credentials.json")
-        write_atomic(CREDENTIALS_FILE, json.dumps({
+        one = Account({"id": "one", "path": os.path.join(d, "one")}, 0, d)
+        write_atomic(one.credentials_file, json.dumps({
             "claudeAiOauth": {"accessToken": "old"},
             "mcpOAuth": {"keep": "me"},
             "organizationUuid": "org-1",
         }), mode=0o600)
-        save_oauth({"accessToken": "new"})
-        after = json.load(open(CREDENTIALS_FILE))
+        save_oauth(one, {"accessToken": "new"})
+        after = json.load(open(one.credentials_file))
         assert after == {
             "claudeAiOauth": {"accessToken": "new"},
             "mcpOAuth": {"keep": "me"},
             "organizationUuid": "org-1",
         }, after
-        assert os.stat(CREDENTIALS_FILE).st_mode & 0o777 == 0o600
+        assert os.stat(one.credentials_file).st_mode & 0o777 == 0o600
 
         # A missing credential file must not crash the write path.
-        CREDENTIALS_FILE = os.path.join(d, "absent.json")
-        save_oauth({"accessToken": "fresh"})
-        assert json.load(open(CREDENTIALS_FILE)) == {"claudeAiOauth": {"accessToken": "fresh"}}
+        absent = Account({"id": "absent", "path": os.path.join(d, "absent-cfg")}, 1, d)
+        save_oauth(absent, {"accessToken": "fresh"})
+        assert json.load(open(absent.credentials_file)) == {"claudeAiOauth": {"accessToken": "fresh"}}
+
+        # The one isolation property the whole refactor exists for: refreshing
+        # one account's token must not put it in another account's file. Two
+        # accounts sharing a credentials path would log each other out of Claude
+        # Code on every rotation, which is a state the user has to fix by hand.
+        other = Account({"id": "other", "path": os.path.join(d, "other")}, 1, d)
+        write_atomic(other.credentials_file, json.dumps({
+            "claudeAiOauth": {"accessToken": "untouched"}, "organizationUuid": "org-2",
+        }), mode=0o600)
+        assert one.credentials_file != other.credentials_file
+        save_oauth(one, {"accessToken": "rotated"})
+        assert json.load(open(other.credentials_file))["claudeAiOauth"]["accessToken"] == "untouched"
 
         # Missing or gutted credentials classify as AuthError (a state only the
         # user can fix), not as a generic error to back off on forever.
-        CREDENTIALS_FILE = os.path.join(d, "nope.json")
         try:
-            get_usage()
+            get_usage(Account({"id": "nope", "path": os.path.join(d, "nope")}, 0, d))
             raise SystemExit("selftest: expected AuthError for missing credentials")
         except AuthError:
             pass
-        CREDENTIALS_FILE = os.path.join(d, "empty.json")
-        write_atomic(CREDENTIALS_FILE, "{}", mode=0o600)
+        gutted_dir = os.path.join(d, "gutted")
+        os.makedirs(gutted_dir)
+        gutted = Account({"id": "gutted", "path": gutted_dir}, 0, d)
+        write_atomic(gutted.credentials_file, "{}", mode=0o600)
         try:
-            get_usage()
+            get_usage(gutted)
             raise SystemExit("selftest: expected AuthError for missing claudeAiOauth")
         except AuthError:
             pass
+
+        # The plan is read on the same load that authenticates, and only used
+        # for display and for skipping a call that cannot have an answer.
+        assert read_plan({"subscriptionType": "Max"}) == "max"
+        assert read_plan({"subscriptionType": " pro "}) == "pro"
+        assert read_plan({}) == ""
+        assert read_plan({"subscriptionType": 7}) == ""
 
         # Second instance is refused while the first holds the lock.
         STATE_DIR = os.path.join(d, "state")
@@ -917,22 +1693,257 @@ def selftest():
         os.close(second)
 
         # The hourly prime ceiling lives on disk, so a restart loop cannot spend
-        # once per restart. Absent stamp means "never primed" -> allowed.
-        PRIME_STAMP_FILE = os.path.join(STATE_DIR, "last-prime")
-        assert last_prime_at() == float("-inf")
-        assert prime_gap_elapsed()[0]
-        record_prime()
-        assert not prime_gap_elapsed()[0], "a prime one second ago must refuse"
-        assert os.stat(PRIME_STAMP_FILE).st_mode & 0o777 == 0o600
-        record_prime(time.time() - MIN_PRIME_GAP - 1)
-        assert prime_gap_elapsed()[0], "past the gap must allow"
+        # once per restart. Absent stamp means "never primed" -> allowed. Per
+        # account, so one account's prime cannot consume another's allowance.
+        pa = Account({"id": "pa", "path": os.path.join(d, "pa")}, 0, d)
+        pb = Account({"id": "pb", "path": os.path.join(d, "pb")}, 1, d)
+        assert last_prime_at(pa) == float("-inf")
+        assert prime_gap_elapsed(pa)[0]
+        record_prime(pa)
+        assert not prime_gap_elapsed(pa)[0], "a prime one second ago must refuse"
+        assert os.stat(pa.prime_stamp_file).st_mode & 0o777 == 0o600
+        assert pa.prime_stamp_file != pb.prime_stamp_file
+        assert prime_gap_elapsed(pb)[0], "another account's prime must not block this one"
+        record_prime(pa, time.time() - MIN_PRIME_GAP - 1)
+        assert prime_gap_elapsed(pa)[0], "past the gap must allow"
         # A stamp in the future means the clock stepped backwards. Allow rather
         # than locking priming out until the clock catches up.
-        record_prime(time.time() + 86400)
-        assert prime_gap_elapsed()[0], "a future stamp must not block priming"
+        record_prime(pa, time.time() + 86400)
+        assert prime_gap_elapsed(pa)[0], "a future stamp must not block priming"
         # Garbage in the file must read as "never primed", not crash the loop.
-        write_atomic(PRIME_STAMP_FILE, "not a number", mode=0o600)
-        assert last_prime_at() == float("-inf")
+        write_atomic(pa.prime_stamp_file, "not a number", mode=0o600)
+        assert last_prime_at(pa) == float("-inf")
+
+    with quiet():
+        # --- multiple accounts -------------------------------------------------
+        #
+        # Everything above proves one account still works. These prove the list does
+        # what it says: the names, the isolation, and the reload.
+        with tempfile.TemporaryDirectory() as d:
+            ACCOUNTS_FILE = os.path.join(d, "accounts.json")
+
+            # A missing file is what every pre-multi-account install looks like, and
+            # it has to keep working rather than take the widget down.
+            try:
+                os.unlink(ACCOUNTS_FILE)
+            except FileNotFoundError:
+                pass
+            solo = load_accounts(d)
+            assert len(solo) == 1
+            assert solo[0].config_dir == DEFAULT_CONFIG_DIR
+            assert solo[0].usage_file == os.path.join(d, "usage.json"), solo[0].usage_file
+            assert solo[0].scoped_file == os.path.join(d, "scoped.json")
+
+            write_atomic(ACCOUNTS_FILE, json.dumps({"version": 1, "accounts": [
+                {"id": "Max", "label": "Personal", "path": os.path.join(d, "c1")},
+                {"id": "claude dad", "label": "", "path": os.path.join(d, "c2")},
+            ]}))
+            two = load_accounts(d)
+            assert [a.id for a in two] == ["max", "claude_dad"], [a.id for a in two]
+            assert two[0].label == "Personal"
+            # An empty label falls back to the id rather than to a blank row.
+            assert two[1].label == "claude_dad", two[1].label
+            # The first account keeps the historical unsuffixed names; the rest are
+            # suffixed, so two accounts cannot share one usage file.
+            assert two[0].usage_file == os.path.join(d, "usage.json")
+            assert two[0].scoped_file == os.path.join(d, "scoped.json")
+            assert two[0].prime_stamp_file == os.path.join(d, "last-prime")
+            assert two[1].usage_file == os.path.join(d, "usage-claude_dad.json")
+            assert two[1].scoped_file == os.path.join(d, "scoped-claude_dad.json")
+            assert two[1].prime_stamp_file == os.path.join(d, "last-prime-claude_dad")
+            assert len({a.usage_file for a in two}) == 2
+
+            # A "~" in the path is the form people actually type, and the widget
+            # writes it, so it has to expand here rather than becoming a literal
+            # "~/.claude-dad" directory that does not exist.
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts": [
+                {"id": "tilde", "path": "~/somewhere"}]}))
+            assert load_accounts(d)[0].config_dir == os.path.expanduser("~/somewhere")
+
+            # One bad entry must not cost the user the accounts that are fine.
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts": [
+                "not an object",
+                {"label": "no id at all"},
+                # A non-string or empty path must be dropped, never pointed at
+                # ~/.claude: that would file the default account's numbers under
+                # this entry's name.
+                {"id": "nopath", "path": 42},
+                {"id": "blankpath", "path": "   "},
+                {"id": "ok1", "path": os.path.join(d, "c1")},
+                {"id": "ok1", "path": os.path.join(d, "c2")},  # duplicate id
+                {"id": "ok2", "path": os.path.join(d, "c3")},
+            ]}))
+            three = load_accounts(d)
+            assert [a.id for a in three] == ["ok1", "ok2"], [a.id for a in three]
+            assert three[1].usage_file == os.path.join(d, "usage-ok2.json")
+            assert three[0].config_dir == os.path.join(d, "c1")
+
+            # Every shape of unusable file lands on the single default account
+            # rather than on zero accounts, which would have the loop divide by
+            # nothing and show an empty widget.
+            for junk in ("not json", "{}", '{"accounts": []}', '{"accounts": "no"}',
+                         '{"accounts": [1, 2, 3]}'):
+                write_atomic(ACCOUNTS_FILE, junk)
+                fallback = load_accounts(d)
+                assert len(fallback) == 1 and fallback[0].config_dir == DEFAULT_CONFIG_DIR, junk
+
+            # The cap is enforced, and the excess is dropped from the end so the
+            # first account the user listed is always the one that is primary.
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts": [
+                {"id": f"a{i}", "path": os.path.join(d, f"c{i}")} for i in range(MAX_ACCOUNTS + 4)]}))
+            capped = load_accounts(d)
+            assert len(capped) == MAX_ACCOUNTS, len(capped)
+            assert capped[0].id == "a0"
+
+            # A rename or a reorder keeps the running account's pacing and cache: a
+            # fresh object would reset an hour of error backoff and spend an
+            # endpoint call the previous poll already earned the right to spend.
+            before = load_accounts(d)
+            before[1].backoff = 1800.0
+            before[1].next_due = 12345.0
+            before[1].scoped._windows = {"fable": {"utilization": 22, "resets_at": "T"}}
+            before[1].scoped._fetched_at = 999.0
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts": [
+                {"id": "a0", "label": "renamed", "path": os.path.join(d, "c0")},
+                {"id": "a1", "path": os.path.join(d, "c1")},
+            ]}))
+            after_reload = reload_accounts(before)
+            assert len(after_reload) == 2
+            assert after_reload[0] is before[0], "an unchanged account keeps its object"
+            assert after_reload[0].label == "renamed"
+            assert after_reload[1] is before[1]
+            assert after_reload[1].backoff == 1800.0
+            assert after_reload[1].next_due == 12345.0
+            assert after_reload[1].scoped._fetched_at == 999.0
+            assert after_reload[1].scoped._windows == {"fable": {"utilization": 22, "resets_at": "T"}}
+            # A label is not a scheduling change, so a rename must not look like one.
+            assert accounts_signature(after_reload) == accounts_signature(load_accounts(d))
+            # A changed path is a different account on purpose: its credentials live
+            # somewhere else entirely.
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts": [
+                {"id": "a0", "path": os.path.join(d, "c0")},
+                {"id": "a1", "path": os.path.join(d, "moved")},
+            ]}))
+            moved = reload_accounts(after_reload)
+            assert moved[1] is not after_reload[1], "a new path is a new account"
+            assert moved[1].config_dir == os.path.join(d, "moved")
+            # Reordering re-points the state files, because the primary slot is
+            # unsuffixed and a swap has to move with it.
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts": [
+                {"id": "a1", "path": os.path.join(d, "c1")},
+                {"id": "a0", "path": os.path.join(d, "c0")},
+            ]}))
+            swapped = reload_accounts(moved)
+            assert [a.id for a in swapped] == ["a1", "a0"]
+            assert swapped[0].usage_file == os.path.join(d, "usage.json"), swapped[0].usage_file
+            assert swapped[1].usage_file == os.path.join(d, "usage-a0.json"), swapped[1].usage_file
+            assert swapped[0].scoped._path == swapped[0].scoped_file
+
+        # Pro accounts cannot have a per-model weekly budget, so the scarce endpoint
+        # call is not worth making for them -- and a downgrade must take the window
+        # away rather than leave a phantom bar on the panel.
+        with tempfile.TemporaryDirectory() as d:
+            pro = Account({"id": "pro", "path": os.path.join(d, "pro")}, 0, d)
+            pro.plan = "pro"
+            pro.scoped._windows = {"fable": {"utilization": 22, "resets_at": "2026-09-29T19:00:00+00:00"}}
+            pro.scoped._fetched_at = time.time()
+            pro.scoped._next_attempt = 0.0
+            spent_calls = []
+            assert not pro.scoped.refresh(lambda _a: spent_calls.append(1))
+            assert not spent_calls, "a plan that cannot have the answer must not spend a call"
+            assert pro.scoped._windows == {}, "a downgrade has to drop the window it had"
+            assert not pro.scoped.refresh(lambda _a: spent_calls.append(1))
+            assert len(spent_calls) == 0
+            # And the merge adds nothing, so the widget has no Fable row to draw.
+            assert pro.scoped.apply({"five_hour": {"utilization": 0.5, "resetAt": "T"}}) \
+                == {"five_hour": {"utilization": 0.5, "resetAt": "T"}}
+            # A max account is unaffected by the skip.
+            mx = Account({"id": "mx", "path": os.path.join(d, "mx")}, 1, d)
+            mx.plan = "max"
+            got = []
+            assert mx.scoped.refresh(lambda _a: got.append(1) or {"limits": [
+                {"kind": "weekly_scoped", "percent": 22, "resets_at": "2026-09-29T19:59:59Z",
+                 "scope": {"model": {"display_name": "Fable"}}}]})
+            assert len(got) == 1
+            assert "fable" in mx.scoped.apply({})
+
+        # Scheduling. The point of all of it: one account's problem is that account's
+        # problem, and a signal cannot become a way around a backoff.
+        with tempfile.TemporaryDirectory() as d:
+            fast = Account({"id": "fast", "path": os.path.join(d, "fast")}, 0, d)
+            slow = Account({"id": "slow", "path": os.path.join(d, "slow")}, 1, d)
+            base = time.monotonic()
+            fast.next_due = base + 60
+            slow.next_due = base + 3600
+            # The minimum, not the maximum: an account in an hour of backoff must
+            # not hold the other one at that cadence.
+            assert 55 <= seconds_until_next([fast, slow]) <= 60, seconds_until_next([fast, slow])
+            slow.next_due = base + 5
+            assert 1 <= seconds_until_next([fast, slow]) <= 5
+            # Never zero, so a due-everything pass cannot become a spin.
+            fast.next_due = slow.next_due = base - 10
+            assert seconds_until_next([fast, slow]) == 1.0
+
+            # A manual refresh comes forward only as far as the floor allows.
+            for a in (fast, slow):
+                a.last_poll = base
+                a.wake_floor = 30.0
+                a.next_due = base + 3600
+            request_poll([fast, slow])
+            assert fast.next_due == base + 30.0
+            assert slow.next_due == base + 30.0
+            # During an error backoff the floor is the whole backoff, so a refresh
+            # cannot short-circuit it -- which is how one 429 becomes a hammer.
+            fast.wake_floor = 3600.0
+            fast.next_due = base + 7200
+            request_poll([fast])
+            assert fast.next_due == base + 3600.0
+            # A prime that succeeded zeroes the floor, because its numbers are
+            # seconds old and there is nothing left to wait for.
+            fast.wake_floor = 0.0
+            fast.next_due = base + 3600
+            request_poll([fast])
+            assert fast.next_due == base
+
+        # poll_account contains failure per account: a dead login on one must not
+        # stop the other updating, and must not raise out of the loop either.
+        with tempfile.TemporaryDirectory() as d:
+            good = Account({"id": "good", "path": os.path.join(d, "good")}, 0, d)
+            bad = Account({"id": "bad", "path": os.path.join(d, "bad")}, 1, d)
+            real_ping_account = ping_usage
+            try:
+                def fake_ping(account):
+                    if account is bad:
+                        raise AuthError("login expired")
+                    return {"five_hour": {"utilization": 42, "resets_at": "T"}}
+                ping_usage = fake_ping
+                poll_account(good, 60)
+                poll_account(bad, 60)  # must not raise
+            finally:
+                ping_usage = real_ping_account
+            assert json.load(open(good.usage_file))["windows"]["five_hour"]["utilization"] == 0.42
+            assert "error" in json.load(open(bad.usage_file))
+            # The failure is isolated to that account's own file.
+            assert "error" not in json.load(open(good.usage_file))
+            # Both are scheduled, and the dead one backs off while the live one
+            # keeps the normal cadence.
+            assert good.backoff == 60 and good.next_due > 0
+            assert bad.backoff == 120, bad.backoff  # doubled from the initial 60
+            assert bad.wake_floor == MIN_POLL_GAP, "a re-auth is fixed by the user, not by waiting"
+            # And a limit that is spent quiets only its own account. The reset
+            # has to be in the future: exhausted_until() clamps a reset that has
+            # already passed down to RESET_SLACK, because "wake now" is the right
+            # answer for a window that turned over an hour ago.
+            spent_acct = Account({"id": "spent", "path": os.path.join(d, "spent")}, 0, d)
+            future_reset = iso(time.time() + 20 * 60)
+            try:
+                ping_usage = lambda _a: {"five_hour": {"utilization": 100.0,
+                                                        "resets_at": future_reset}}
+                poll_account(spent_acct, 60)
+            finally:
+                ping_usage = real_ping_account
+            assert spent_acct.next_due > time.monotonic() + 60, spent_acct.next_due
+
 
     print("selftest ok")
 
@@ -945,6 +1956,9 @@ def prime_now():
     Claude Code owns, so if a daemon is already running this defers to it
     instead of racing it.
 
+    Primes the first configured account, which is the one --prime-now meant
+    before there was more than one; the running daemon primes all of them.
+
     Deliberately not subject to MIN_PRIME_GAP: someone typing this has decided
     to spend, and a tool that silently declines is worse than one that obeys.
     It still records the stamp, so an automatic prime cannot double-spend on
@@ -953,7 +1967,7 @@ def prime_now():
     if single_instance_lock() is None:
         raise SystemExit("kclaude-daemon: a daemon is already running; ask it instead:\n"
                          "  systemctl --user kill -s USR2 kclaude.service")
-    prime_session()
+    prime_session(load_accounts()[0])
 
 
 if __name__ == "__main__":

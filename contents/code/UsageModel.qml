@@ -15,9 +15,21 @@ Item {
     // Empty when everything is fine.
     readonly property string dataError: _provider.fileError
 
+    // Which account these numbers belong to. Not read from the usage file: the
+    // collector writes one file per account and the widget is the thing that
+    // knows which is which, so the label travels alongside the read rather than
+    // inside it.
+    property string accountId: ""
+    property string accountLabel: ""
+
     property string filePath: "~/.local/state/kclaude/usage.json"
     property real warningThreshold: 0.75
     property real criticalThreshold: 0.9
+
+    // The subscription type, from the collector (see FileUsageProvider.plan).
+    // Empty when the file does not carry one, which is the case for a
+    // hand-written usage file.
+    readonly property string plan: _provider.plan
 
     property var _lastGoodState: null
     property bool _hasGoodState: false
@@ -62,6 +74,10 @@ Item {
             // numbers, but flag them as not live.
             root._applyUsage(_provider.lastUsage, _provider.isStale)
         } else if (_provider.isOffline && root._hasGoodState) {
+            // A file that cannot be read at all also cannot clear a plan: the
+            // collector is the only writer of that field, so an account whose
+            // file went missing keeps the badge it last proved rather than
+            // flickering to no badge and back.
             root._applyUsage(root._lastGoodState, true)
         } else if (_provider.isOffline && !root._hasGoodState) {
             root.status = "unknown"

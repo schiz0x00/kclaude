@@ -42,16 +42,18 @@ Run what CI runs:
 
 ```bash
 node tests/shell-quote.test.js
+node tests/accounts.test.js
 node tests/package-layout.test.js
 python3 daemon/kclaude-daemon --selftest
 shellcheck scripts/*.sh
 
 export QT_QPA_PLATFORM=offscreen
 qmllint contents/ui/*.qml contents/code/*.qml contents/config/*.qml
-qmltestrunner -input tests/tst_timeutils.qml
-qmltestrunner -input tests/tst_provider.qml
-qmltestrunner -input tests/tst_config.qml
-qmltestrunner -input tests/tst_primer.qml
+for t in tests/tst_timeutils.qml tests/tst_provider.qml tests/tst_refresh.qml \
+         tests/tst_config.qml tests/tst_configaccounts.qml tests/tst_accounts.qml \
+         tests/tst_primer.qml; do
+    qmltestrunner -input "$t"
+done
 ```
 
 `tests/tst_service.qml` is deliberately left out of CI: it drives a real systemd
@@ -59,7 +61,9 @@ user manager and will stop and restart `kclaude.service` if you have it
 installed. Run it by hand when you touch `ServiceControl.qml`.
 
 New logic wants one runnable check, not a suite. The daemon keeps its checks in
-`--selftest`; the QML suites are hermetic and take no fixtures.
+`--selftest`; the QML suites need no network and no `~/.claude`, and the only
+file they read is `tests/fixtures/usage.json`, which `tst_refresh.qml` uses as a
+file to point the real dataengine at rather than parsing.
 
 ## Commits and pull requests
 
