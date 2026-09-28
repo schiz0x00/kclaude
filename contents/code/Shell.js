@@ -35,16 +35,29 @@ function dirName(p) {
 // be a format specifier. This is the only command here that writes, and the only
 // place widget-supplied text becomes a command's output rather than its input.
 //
-// chmod rather than umask, and after the write rather than before: a umask only
+// Written to a temporary file in the same directory and renamed into place, the
+// way the collector's write_atomic does it, because this is the only writer of
+// accounts.json and both its readers treat anything they cannot parse as "no
+// accounts, fall back to ~/.claude". A truncating write interrupted between the
+// open and the close therefore does not silently collapse a multi-account setup.
+//
+// chmod rather than umask, and on the temporary before the rename: a umask only
 // applies to files the shell *creates*, so re-saving an existing accounts.json
-// would leave whatever mode it already had. The file holds no tokens, but it
-// does say which Claude config directories the user has, and that should not
+// would leave whatever mode it already had, and a first-creation file would sit
+// at 0666&~umask until the chmod ran. Chmod'ing the temporary first means the
+// file is never briefly readable at a wider mode. The file holds no tokens, but
+// it does say which Claude config directories the user has, and that should not
 // depend on the umask the config dialog happened to start under.
 function writeFile(filePath, contents) {
     var dir = dirName(filePath)
     var mkdir = dir.length > 0 ? "mkdir -p " + path(dir) + " && " : ""
-    return mkdir + "printf '%s' " + quote(String(contents)) +
-        " > " + path(filePath) + " && chmod 600 " + path(filePath)
+    // mktemp for the same reason write_atomic uses mkstemp: a name the caller
+    // does not get to choose, so nothing can be pre-positioned at it.
+    var tmp = "$(mktemp " + path((dir.length > 0 ? dir : ".") + "/.kclaude-tmp.XXXXXX") + ")"
+    return mkdir + "d=" + tmp + " " +
+        "&& printf '%s' " + quote(String(contents)) + " > \"$d\" " +
+        '&& chmod 600 "$d" && mv -f "$d" ' + path(filePath) +
+        ' || { rm -f -- "$d" 2>/dev/null; exit 1; }'
 }
 
 // Directories under `home` whose name looks like a Claude config directory, for

@@ -100,6 +100,60 @@ TestCase {
         compare(parsed[0].id, "claude_dad")
     }
 
+    // A non-string id is dropped rather than coerced. String(42) would invent the
+    // id "42" out of a number the collector requires to be a string, so the two
+    // halves would disagree about a row the settings page still draws -- and
+    // the disagreement is silent, because the panel simply watches a file the
+    // collector never writes.
+    function test_05a_non_string_ids_are_dropped_not_coerced() {
+        var parsed = list.parse({ accounts: [
+            { id: 42, path: "/a" },
+            { id: true, path: "/b" },
+            { id: ["work"], path: "/c" },
+            { id: { id: "work" }, path: "/d" },
+            { id: "real", path: "/e" }
+        ]})
+        compare(parsed.length, 1)
+        compare(parsed[0].id, "real")
+    }
+
+    // The id is part of a filename, so it is capped. An over-long one produced
+    // "usage-<id>.json" past NAME_MAX, after which every write for that account
+    // failed with ENAMETOOLONG and the poll's backoff turned that into "this
+    // account silently shows nothing for ever" with one line in the journal.
+    // The collector caps it identically; see tests/fixtures/slugs.json.
+    function test_05b_ids_are_length_capped_so_the_filename_fits() {
+        // Not named `long`: that is a reserved word in QML's JavaScript dialect.
+        var oversized = ""
+        for (var i = 0; i < 300; i++) oversized += "a"
+        var parsed = list.parse({ accounts: [{ id: oversized, path: "/a" }]})
+        compare(parsed.length, 1)
+        verify(parsed[0].id.length <= 64, "id is " + parsed[0].id.length + " chars")
+        // "usage-" + id + ".json" has to fit a 255-byte NAME_MAX.
+        verify(("usage-" + parsed[0].id + ".json").length <= 255)
+    }
+
+    // Non-ASCII ids are the case the two halves used to disagree about, silently
+    // and in the worst direction: the collector's Python isalnum() is Unicode
+    // aware and this regex is not, so the panel watched a file the collector
+    // never wrote. Both sides now read tests/fixtures/slugs.json.
+    function test_05c_non_ascii_ids_agree_with_the_collector() {
+        var parsed = list.parse({ accounts: [
+            { id: "café", path: "/a" },
+            { id: "naïve", path: "/b" }
+        ]})
+        compare(parsed.length, 2)
+        compare(parsed[0].id, "caf", "the collector derives 'caf' for this too")
+        compare(parsed[1].id, "na_ve")
+        // An id with nothing ASCII in it has no usable slug at all, so the entry
+        // is dropped rather than filed under "".
+        var dropped = list.parse({ accounts: [
+            { id: "клиент", path: "/a" },
+            { id: "日本", path: "/b" }
+        ]})
+        compare(dropped.length, 1, "falls back to the single default account")
+    }
+
     // Two accounts sharing an id would share every state file the collector
     // derives from it.
     function test_06_duplicate_ids_are_dropped() {

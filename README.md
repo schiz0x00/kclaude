@@ -131,7 +131,7 @@ write `usage.json` yourself (format below).
 
 - KDE Plasma 6
 - `kpackagetool6` (from `plasma-sdk` or `kpackage`)
-- Python 3 — only for the optional collector daemon
+- Python 3.9 or newer — only for the optional collector daemon
 
 ## Installation
 
@@ -359,7 +359,8 @@ fraction from 0.0 to 1.0, and `resetAt` is an ISO-8601 timestamp:
         }
     },
     "updatedAt": "2026-07-30T13:37:00Z",
-    "plan": "max"
+    "plan": "max",
+    "account": "claude"
 }
 ```
 
@@ -369,10 +370,20 @@ daemon writes it because it is the only thing that reads the credentials, and
 shown — anything else becomes no badge, so a hand-written file cannot put
 arbitrary text on the panel.
 
+An optional top-level `"account"` is the id the numbers belong to. The *filename*
+carries an id too, but that one follows the account's position in the list, so
+reordering the accounts moves a filename between accounts for a poll interval.
+This key does not move: the widget refuses a file that names a different
+account rather than drawing it. Omit it and the file is taken at its word, so a
+hand-written file — or one from a collector older than this key — keeps working
+unchanged.
+
 With more than one account configured there is one such file per account. The
 first is `usage.json` as above; the rest are `usage-<id>.json` beside it, named
 after the id in `accounts.json`. Each is independent, so a corrupt or missing
-one only affects its own row.
+one only affects its own row. Ids are lowercased, reduced to ASCII letters and
+digits, and capped at 64 characters so the filename always fits; a non-ASCII id
+is not transliterated, it is truncated at the first character that is not one.
 
 Unknown window keys are accepted and title-cased for display. Malformed entries
 are skipped rather than shown as 0%. An optional top-level `"error"` string is

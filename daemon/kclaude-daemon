@@ -14,6 +14,7 @@ import datetime
 import fcntl
 import io
 import json
+import math
 import os
 import random
 import select
@@ -147,8 +148,43 @@ WINDOW_KEYS = ("five_hour", "seven_day", "thirty_day")
 
 
 def iso(epoch):
-    """Unix epoch -> the ISO-8601 form the file contract uses."""
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+    """Unix epoch -> the ISO-8601 form the file contract uses.
+
+    Total, by design: a value that cannot be formatted -- NaN from a malformed
+    header, or an epoch past what time.gmtime accepts -- returns None rather
+    than raising, because every caller of this is parsing a response nobody
+    promised was well formed, and an exception here takes the whole poll down
+    instead of dropping the one field that is wrong.
+    """
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def parse_iso(text):
+    """ISO-8601 -> a POSIX timestamp, or None.
+
+    datetime.fromisoformat only learned to read a trailing "Z" in Python 3.11,
+    and this file writes exactly that form itself (see iso). Relying on the
+    interpreter version would be an undeclared floor on a daemon that packaging
+    describes only as "python3", and on an older one *every* reset time here
+    would fail to parse -- which does not raise, it silently degrades the whole
+    go-quiet-until-reset design into a flat one-hour backoff.
+
+    A value with no offset is read as UTC, matching iso()'s output.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
 
 
 class AuthError(Exception):
@@ -157,10 +193,25 @@ class AuthError(Exception):
     "error" key in usage.json, and retried gently in case they just did."""
 
 
-def write_atomic(path, text, mode=0o644):
+class CredentialsUnwritable(AuthError):
+    """The token was refreshed but the file could not be written back.
+
+    An AuthError because only the user can fix it -- a read-only $HOME, a full
+    disk -- and because the alternative is worse: the server has already
+    rotated the refresh token, so the copy still on disk is dead. The fresh
+    token is kept on the account so a later poll persists it rather than
+    spending a second rotation on a token the server will reject.
+    """
+
+
+def write_atomic(path, text, mode=0o600):
     """Write via temp file + rename so readers never observe a partial file."""
     directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
+    # 0700, not the 0777&~umask this used to take. The directory holds the
+    # account ids in its filenames and the usage files beside it, none of which
+    # another local user has any business reading. Nothing here needs a wider
+    # mode: the widget that reads these files runs as this same user.
+    os.makedirs(directory, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
         with os.fdopen(fd, "w") as f:
@@ -170,6 +221,17 @@ def write_atomic(path, text, mode=0o644):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        # fsync the directory too. os.replace only guarantees the rename reaches
+        # the disk once the *parent* has been synced; without this a crash can
+        # leave the directory entry pointing at the previous file. For
+        # usage.json that costs a poll interval. For .credentials.json it costs
+        # the login, because the file we would revert to holds a refresh token
+        # the server has already invalidated.
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except BaseException:
         # suppress: never let cleanup replace the original traceback.
         with contextlib.suppress(OSError):
@@ -177,17 +239,35 @@ def write_atomic(path, text, mode=0o644):
         raise
 
 
+# An id is part of a filename on both sides of the file contract, so it is held
+# to what a filename can carry. 11 bytes of affix ("usage-", ".json") plus a
+# 255-byte NAME_MAX leaves 244 as the hard ceiling; 64 is well inside it and
+# leaves room for a suffixed name that is not usage.json.
+#
+# There used to be no cap at all, on either side. An id long enough to overflow
+# NAME_MAX made every write to that account's usage file fail with ENAMETOOLONG,
+# which the poll's backoff swallowed into "this account silently shows nothing
+# for ever" with a single journal line.
+MAX_ID_LENGTH = 64
+
+
 def account_id(raw):
     """"Claude Dad" -> "claude_dad": the key and filename-safe id for an account.
 
-    Anything that could escape a directory name becomes "_", and a result with
-    nothing usable in it is rejected by the caller rather than defaulted, since
-    two accounts both called "" would collide on every state file they share.
+    ASCII alphanumerics only, deliberately. This rule is implemented a second
+    time in Accounts.slug, in another language, and the two have to agree
+    character for character -- which they did not: Python's str.isalnum() is
+    Unicode-aware and the JS regex is not, so "café" became "café" here and
+    "caf" there. The collector wrote usage-café.json while the panel watched
+    usage-caf.json, and that account showed nothing for ever with no
+    diagnostic. Anything else becomes "_", and a result with nothing usable in
+    it is rejected by the caller rather than defaulted, since two accounts both
+    called "" would collide on every state file they share.
     """
     if not isinstance(raw, str):
         return ""
-    slug = "".join(c if c.isalnum() else "_" for c in raw.strip().lower())
-    return "_".join(part for part in slug.split("_") if part)
+    slug = "".join(c if c.isascii() and c.isalnum() else "_" for c in raw.strip().lower())
+    return "_".join(part for part in slug.split("_") if part)[:MAX_ID_LENGTH].strip("_")
 
 
 class Account:
@@ -236,6 +316,20 @@ class Account:
         self.last_poll = 0.0
         self.wake_floor = 0.0
         self.backoff = DEFAULT_INTERVAL
+
+        # A fixed per-account offset, so restarts and the accounts in a list do
+        # not all come back on the same second. Drawn once and added to this
+        # account's own schedule, rather than added to the loop's sleep: the
+        # sleep is shared, so jittering it stretched every effective interval to
+        # 60-75s and quietly contradicted the documented 60s cadence.
+        self.jitter = random.uniform(0, 15)
+
+        # A token the server has already rotated but that could not be written
+        # back. Held here rather than in the credentials file because that file
+        # is the thing that could not be written. See save_oauth's caller in
+        # refresh_access_token: posting the refresh token again would come back
+        # invalid_grant and cost the user their login.
+        self.pending_oauth = None
 
         # From the credentials, not from the config file: the plan decides
         # whether a per-model weekly budget can exist at all, and the user
@@ -301,7 +395,12 @@ def load_accounts(state_dir=None):
 
     accounts = []
     seen = set()
-    for entry in entries[:MAX_ACCOUNTS]:
+    # The cap is on how many accounts are *kept*, not on how many entries are
+    # read. Slicing the input meant a file whose first MAX_ACCOUNTS entries were
+    # all unusable fell through to the default account, even when entry nine was
+    # perfectly good -- and the widget, which caps its own output, disagreed
+    # with the collector about which rows exist. Both sides cap the kept list.
+    for position, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue
         account = Account(entry, len(accounts), state_dir)
@@ -317,14 +416,37 @@ def load_accounts(state_dir=None):
             continue
         seen.add(account.id)
         accounts.append(account)
+        if len(accounts) >= MAX_ACCOUNTS:
+            ignored = len(entries) - position - 1
+            if ignored > 0:
+                print(f"kclaude-daemon: {MAX_ACCOUNTS} accounts is the maximum; "
+                      f"ignoring {ignored} more from {ACCOUNTS_FILE}", file=sys.stderr)
+            break
     if not accounts:
         print(f"kclaude-daemon: no usable account in {ACCOUNTS_FILE}; "
               f"falling back to {DEFAULT_CONFIG_DIR}", file=sys.stderr)
         return [default_account(state_dir)]
-    if len(entries) > MAX_ACCOUNTS:
-        print(f"kclaude-daemon: {len(entries)} accounts configured, using the first {MAX_ACCOUNTS}",
-              file=sys.stderr)
     return accounts
+
+
+def accounts_file_state():
+    """Whether accounts.json is absent, unusable, or readable.
+
+    Absent is the normal case on every install that predates multiple accounts,
+    and correctly means the single default account. Present but unreadable is
+    a different thing: a damaged or half-written file, which both readers used
+    to treat as "no accounts" -- silently repointing the collector at ~/.claude
+    and refreshing an account's token the user may not have chosen. The two are
+    told apart here so that only the second one keeps the list already running.
+    """
+    try:
+        with open(ACCOUNTS_FILE) as f:
+            json.load(f)
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, ValueError):
+        return "unreadable"
+    return "ok"
 
 
 def accounts_signature(accounts):
@@ -371,7 +493,7 @@ def single_instance_lock():
     Claude Code itself has to re-authenticate. Refusing to start twice is worth
     more than the convenience of a second instance.
     """
-    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     fd = os.open(LOCK_FILE, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -434,7 +556,14 @@ def load_credentials(account):
         return json.load(f)
 
 
-def save_oauth(account, oauth):
+# The only keys a refresh changes. Everything else in the object -- scopes,
+# subscriptionType, rateLimitTier, refreshTokenExpiresAt -- belongs to Claude
+# Code, and replacing the whole object is how a sibling key *inside*
+# claudeAiOauth gets lost in exactly the way mcpOAuth was.
+OAUTH_CHANGED_KEYS = ("accessToken", "refreshToken", "expiresAt")
+
+
+def save_oauth(account, oauth, expected_refresh=None):
     """Merge the refreshed token back into this account's file, re-reading it
     first.
 
@@ -442,32 +571,64 @@ def save_oauth(account, oauth):
     organizationUuid) on its own schedule. Re-reading immediately before the
     write shrinks the lost-update window from a whole poll interval to
     microseconds. It cannot close it -- Claude Code does not take our lock -- so
-    only the one key we actually changed is written back.
+    only the keys we actually changed are written back, and only into a
+    claudeAiOauth that is still the one we read.
 
-    The file written is the account's, never a shared one. Two accounts
-    refreshing at the same moment are two independent rotations, and a token
-    landing in the wrong credentials file logs the other account out of Claude
-    Code until the user re-authenticates.
+    An unreadable file is not an empty one. Substituting {} for a failed read is
+    what turns a transient parse error -- Claude Code caught mid-write, a
+    truncated file, a momentary EIO -- into a permanently deleted mcpOAuth, so
+    anything but a genuinely absent file propagates and nothing is written at
+    all. Only the absent case creates the file.
+
+    expected_refresh, when given, is the refresh token that was sent to the
+    server. If the file no longer holds it, Claude Code re-authenticated while
+    this refresh was in flight and the reply about to be written belongs to a
+    login that no longer exists. Skipped, and False returned.
+
+    Returns True if the file was written, False if it was deliberately left
+    alone.
     """
     try:
         creds = load_credentials(account)
+        existed = True
+    except FileNotFoundError:
+        creds, existed = {}, False
     except (OSError, ValueError):
-        creds = {}
-    creds["claudeAiOauth"] = oauth
+        # Propagated on purpose: the caller's backoff retries, and the file
+        # stays exactly as Claude Code left it.
+        raise
+
+    if existed:
+        on_disk = creds.get("claudeAiOauth")
+        if expected_refresh is not None and isinstance(on_disk, dict):
+            current = on_disk.get("refreshToken")
+            if current is not None and current != expected_refresh:
+                return False
+        target = on_disk if isinstance(on_disk, dict) else {}
+    else:
+        # Nothing to preserve, and `oauth` is the whole of what we know, so take
+        # all of it -- otherwise the plan badge loses subscriptionType.
+        target = dict(oauth)
+    creds["claudeAiOauth"] = target
+    for key in OAUTH_CHANGED_KEYS:
+        if key in oauth:
+            target[key] = oauth[key]
     # 0600: the file holds live OAuth tokens.
     write_atomic(account.credentials_file, json.dumps(creds, indent=2), mode=0o600)
+    return True
 
 
 def refresh_access_token(account, oauth):
     """Exchange the refresh token. The server rotates it, so persist at once."""
+    sent = oauth.get("refreshToken")
     body = json.dumps({
         "grant_type": "refresh_token",
-        "refresh_token": oauth["refreshToken"],
+        "refresh_token": sent,
         "client_id": CLIENT_ID,
     }).encode()
     req = urllib.request.Request(TOKEN_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with OPENER.open(req, timeout=30) as resp:
             data = json.load(resp)
     except urllib.error.HTTPError as e:
         # 400 is what an invalid/rotated-away refresh token actually returns
@@ -476,12 +637,41 @@ def refresh_access_token(account, oauth):
             raise AuthError(f"Claude Code login expired for {account.label}: "
                             "run 'claude' in that config directory and sign in again") from e
         raise
-    oauth["accessToken"] = data["access_token"]
+    # Validated into a *local* dict before `oauth` is touched. A 200 whose body
+    # is not a token reply has not rotated anything, so it is an ordinary
+    # retryable protocol error -- but it must be raised before any mutation, or
+    # a half-applied reply is what ends up on disk.
+    if not isinstance(data, dict) or not isinstance(data.get("access_token"), str):
+        raise ValueError("the token endpoint replied 200 without an access token")
+    fresh = dict(oauth)
+    fresh["accessToken"] = data["access_token"]
     if "refresh_token" in data:
-        oauth["refreshToken"] = data["refresh_token"]
+        fresh["refreshToken"] = data["refresh_token"]
+    # No expires_in means the expiry is *unknown*, not unchanged: leaving the
+    # stale clock in place makes token_expired() true for ever, which turns
+    # every poll into a token request against the endpoint.
+    fresh["expiresAt"] = 0
     if "expires_in" in data:
-        oauth["expiresAt"] = int(time.time() * 1000) + data["expires_in"] * 1000
-    save_oauth(account, oauth)
+        with contextlib.suppress(TypeError, ValueError):
+            fresh["expiresAt"] = int(time.time() * 1000) + int(data["expires_in"]) * 1000
+
+    # The server has rotated the refresh token by this point and the only copy
+    # of the new one is in `fresh`, so the write is the last thing that can go
+    # wrong -- and if it does, the fresh token is kept on the account so a later
+    # poll persists it instead of POSTing a token the server has invalidated.
+    try:
+        wrote = save_oauth(account, fresh, expected_refresh=sent)
+    except OSError as e:
+        account.pending_oauth = fresh
+        raise CredentialsUnwritable(
+            f"could not save the refreshed token for {account.label} ({e}); "
+            "free some disk or check the file's permissions, then hit Refresh") from e
+    if not wrote:
+        # Claude Code re-authenticated underneath us. Our reply is for a login
+        # that no longer exists, so it is discarded rather than written.
+        return oauth["accessToken"]
+    oauth.clear()
+    oauth.update(fresh)
     return oauth["accessToken"]
 
 
@@ -526,6 +716,25 @@ CLI_VERSION = claude_cli_version()
 SESSION_ID = str(uuid.uuid4())
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every 3xx, rather than following it.
+
+    CPython's default redirect_request copies every header across a redirect
+    except content-length and content-type -- so `Authorization: Bearer
+    sk-ant-oat01-...` follows a 302 to whatever host sent it, and the daemon
+    would then hand a live OAuth token to a third party. None of the four
+    endpoints below redirect in normal operation, so refusing costs nothing.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# One opener for every request, so the guard above cannot be forgotten by a
+# caller added later the way a per-call timeout can be.
+OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def cli_headers(access_token):
     """The header block claude-cli puts on every authenticated request."""
     return {
@@ -542,7 +751,7 @@ def fetch_usage(access_token):
     # Matches claude-cli's own GET of this endpoint: the shared block and
     # nothing else -- it sends no anthropic-beta here, so neither do we.
     req = urllib.request.Request(USAGE_URL, headers=cli_headers(access_token))
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with OPENER.open(req, timeout=10) as resp:
         return json.load(resp)
 
 
@@ -554,6 +763,16 @@ def with_token(account, call):
     cannot be forgotten by a new caller, and so the plan is picked up on the same
     read that authenticates.
     """
+    # A previous refresh rotated the token server-side but could not write it
+    # back. Persist that one first: it is the only copy of a live refresh token,
+    # and posting the dead one to the endpoint again would come back
+    # invalid_grant and cost the user their login. If the file is still
+    # unwritable this raises, which is the honest outcome -- the next poll
+    # retries, and the schedule backs off around it.
+    if account.pending_oauth is not None:
+        save_oauth(account, account.pending_oauth)
+        account.pending_oauth = None
+
     try:
         oauth = load_credentials(account)["claudeAiOauth"]
     except FileNotFoundError:
@@ -565,11 +784,15 @@ def with_token(account, call):
     account.plan = read_plan(oauth)
     # Refresh up front when the token is known-expired, instead of burning a
     # request to discover it.
-    access_token = refresh_access_token(account, oauth) if token_expired(oauth) else oauth["accessToken"]
+    refreshed = token_expired(oauth)
+    access_token = refresh_access_token(account, oauth) if refreshed else oauth["accessToken"]
     try:
         return call(access_token)
     except urllib.error.HTTPError as e:
-        if e.code != 401:
+        # At most one rotation per call. Refreshing again on a token that was
+        # minted seconds ago spends a second rotation and then reports whatever
+        # the retry fails with, which says nothing about the real problem.
+        if e.code != 401 or refreshed:
             raise
         return call(refresh_access_token(account, oauth))
 
@@ -625,14 +848,33 @@ def usage_from_headers(headers):
     """
     raw = {}
     for key, prefix in (("five_hour", "5h"), ("seven_day", "7d")):
+        # Parsed independently, and a value only kept if it is a real finite
+        # number. Sharing one try used to mean a fractional reset epoch
+        # ("1759...0.0", which servers do send) threw away a utilization that
+        # had already parsed -- and because a one-window dict is still truthy,
+        # collect then saw a reply and never fell back to the endpoint, so the
+        # five-hour bar simply vanished from the panel with nothing said.
         try:
             utilization = float(headers.get(f"anthropic-ratelimit-unified-{prefix}-utilization"))
-            reset = int(headers.get(f"anthropic-ratelimit-unified-{prefix}-reset"))
         except (TypeError, ValueError):
+            continue
+        if not math.isfinite(utilization):
+            # float("nan") and float("inf") parse cleanly and would otherwise
+            # ride all the way into usage.json, where json.dumps writes a bare
+            # NaN token that is not valid JSON at all -- and the widget's
+            # JSON.parse rejects, taking the account offline. Cheaper to refuse
+            # the value here than to discover it in the reader.
+            continue
+        try:
+            reset = int(float(headers.get(f"anthropic-ratelimit-unified-{prefix}-reset")))
+        except (TypeError, ValueError):
+            continue
+        moment = iso(reset)
+        if moment is None:
             continue
         raw[key] = {
             "utilization": utilization * 100.0,
-            "resets_at": iso(reset),
+            "resets_at": moment,
         }
     return raw
 
@@ -647,7 +889,7 @@ def ping_usage(account):
     """
     def send(access_token):
         try:
-            with urllib.request.urlopen(ping_request(access_token), timeout=30) as resp:
+            with OPENER.open(ping_request(access_token), timeout=30) as resp:
                 return usage_from_headers(resp.headers)
         except urllib.error.HTTPError as e:
             if e.code != 429:
@@ -676,22 +918,33 @@ def exhausted_until(raw, now=None):
     """
     now = time.time() if now is None else now
     waits = []
+    if not isinstance(raw, dict):
+        return None
     for window in raw.values():
         if not isinstance(window, dict):
             continue
         utilization = window.get("utilization")
-        if not isinstance(utilization, (int, float)) or utilization < 100.0:
+        if not isinstance(utilization, (int, float)) or isinstance(utilization, bool):
             continue
-        try:
-            reset = datetime.datetime.fromisoformat(window["resets_at"]).timestamp()
-        except (KeyError, TypeError, ValueError):
-            # Exhausted with no reset time to wait for. An hour is the wrong
-            # answer by at most an hour, and never a busy loop.
+        # NaN compares False against every bound, so `utilization < 100.0` alone
+        # reads a NaN window as spent -- and then this returns a five-hour wait
+        # for a window that is in no such state. Checked explicitly.
+        if not math.isfinite(utilization) or utilization < 100.0:
+            continue
+        reset = parse_iso(window.get("resets_at"))
+        if reset is None:
+            # Exhausted with no usable reset time to wait for. An hour is the
+            # wrong answer by at most an hour, and never a busy loop.
             waits.append(MAX_BACKOFF)
             continue
         # A little past the reset, not exactly on it: server and local clocks
         # disagree by seconds, and waking early just earns another refusal.
-        # Capped, so a bogus timestamp cannot park the daemon for a week.
+        # Capped, so a bogus timestamp cannot park the daemon for a week, and
+        # floored at MIN_POLL_GAP: a reset that has already passed used to
+        # produce exactly RESET_SLACK (10s), which is below this daemon's own
+        # 30s floor and six times below its 60s cadence -- a clock skew or a
+        # stale header, and the refusal being answered is pinged every ten
+        # seconds for the rest of the day.
         waits.append(min(FIVE_HOURS, max(0.0, reset - now) + RESET_SLACK))
     return max(waits) if waits else None
 
@@ -743,7 +996,7 @@ def prime_session(account):
     free instead of spending a second request to ask for it.
     """
     def send(access_token):
-        with urllib.request.urlopen(prime_request(access_token), timeout=30) as resp:
+        with OPENER.open(prime_request(access_token), timeout=30) as resp:
             return resp.headers, json.load(resp)
 
     headers, reply = with_token(account, send)
@@ -769,7 +1022,16 @@ def normalize_window(window):
     # bool is an int subclass, and utilization: true is not a percentage.
     if not isinstance(utilization, (int, float)) or isinstance(utilization, bool):
         return None
-    return {"utilization": utilization / 100.0, "resetAt": window.get("resets_at")}
+    # Finite and in range. NaN survives every `isinstance` check and compares
+    # False against everything, so without this a single bad number reaches
+    # json.dumps, which writes a bare NaN token that is not valid JSON and that
+    # the widget's JSON.parse therefore rejects. Above 100 is out of contract
+    # too: the widget would draw a bar pinned at full next to a label reading
+    # "550%".
+    if not math.isfinite(utilization):
+        return None
+    return {"utilization": min(100.0, max(0.0, utilization)) / 100.0,
+            "resetAt": window.get("resets_at")}
 
 
 def normalize_windows(raw):
@@ -880,6 +1142,16 @@ class ScopedWindows:
             return
         if not isinstance(data, dict):
             return
+        # Which account this cache belongs to. The file name is derived from the
+        # account's *position* in the list, so reordering the settings page
+        # points a slot at a different account's file -- and without this the
+        # account that moved would adopt its new neighbour's Fable window and
+        # publish another account's percentage under its own name. A cache that
+        # does not claim this account is discarded rather than believed.
+        owner = data.get("account")
+        mine = self._account.id if self._account is not None else ""
+        if owner != mine:
+            return
         windows = data.get("windows")
         if isinstance(windows, dict):
             self._windows = windows
@@ -894,7 +1166,8 @@ class ScopedWindows:
 
     def _save(self):
         write_atomic(self._path, json.dumps(
-            {"windows": self._windows, "fetchedAt": self._fetched_at}, indent=2), mode=0o600)
+            {"account": self._account.id if self._account is not None else "",
+             "windows": self._windows, "fetchedAt": self._fetched_at}, indent=2), mode=0o600)
 
     def due(self, now=None):
         return (time.time() if now is None else now) >= self._next_attempt
@@ -982,13 +1255,28 @@ def write_usage(account, raw, scoped=None):
     payload = {
         "windows": windows,
         "updatedAt": iso(time.time()),
+        # Which account these numbers are. The file name carries an id too, but
+        # it is derived from the account's *position* in the list, so a reorder
+        # in the settings page moves a filename between accounts for a poll
+        # interval. This key does not move, so the widget can tell "this file is
+        # briefly stale" from "this file is now someone else's" and refuse the
+        # second rather than draw it. Optional on the way in: a hand-written
+        # file, or one from a collector older than this key, simply omits it and
+        # is taken at its word.
+        "account": account.id,
     }
     # The plan is only knowable from the credentials, which the widget must not
     # read -- they hold live tokens. So the collector publishes it, and the
     # widget treats it as optional so a hand-written usage file still works.
     if account.plan:
         payload["plan"] = account.plan
-    write_atomic(account.usage_file, json.dumps(payload, indent=4))
+    # allow_nan=False: a NaN or Infinity reaching this point would be written as
+    # a bare token that is not JSON at all, and the widget's JSON.parse would
+    # reject the whole document and take the account offline. Refusing to write
+    # turns that into a ValueError, which the caller's existing backoff path
+    # already handles -- a wrong number must not become a lost file.
+    write_atomic(account.usage_file,
+                 json.dumps(payload, indent=4, allow_nan=False))
 
 
 def write_error(account, message):
@@ -1009,6 +1297,10 @@ def write_error(account, message):
     payload.setdefault("windows", {})
     payload.setdefault("updatedAt", iso(time.time()))
     payload["error"] = message
+    # Set, not defaulted: an error is exactly when the widget most needs to know
+    # whose file it is reading, since this path is also what runs when the file
+    # is found damaged.
+    payload["account"] = account.id
     write_atomic(account.usage_file, json.dumps(payload, indent=4))
 
 
@@ -1079,7 +1371,10 @@ def poll_account(account, interval):
         # that too or it spends the day pinging a wall.
         if spent is None:
             spent = account.scoped.exhausted_until()
-        delay = interval if spent is None else spent
+        # Floored at MIN_POLL_GAP even when the wait is a real one, so no
+        # arithmetic upstream can turn "this window is spent" into a faster poll
+        # than this daemon is willing to make.
+        delay = interval if spent is None else max(spent, MIN_POLL_GAP)
         # Out of quota is not a pace to nudge: a Refresh click cannot buy a
         # number the server will not give, so the wait is the floor too.
         account.wake_floor = MIN_POLL_GAP if spent is None else delay
@@ -1088,7 +1383,11 @@ def poll_account(account, interval):
                   "until the window resets", file=sys.stderr)
     except AuthError as e:
         print(f"kclaude-daemon: {e}", file=sys.stderr)
-        write_error(account, str(e))
+        # The schedule is set before the diagnostic is written, not after. This
+        # handler is the one place that does I/O of its own, and an unwritable
+        # state directory must degrade the file rather than end the process --
+        # one read-only directory plus one expired login used to take down every
+        # account, and Restart=on-failure turned it into a 30-second loop.
         delay = account.backoff
         account.backoff = min(account.backoff * 2, MAX_BACKOFF)
         # The user's next move is re-authenticating and hitting Refresh, so
@@ -1096,6 +1395,11 @@ def poll_account(account, interval):
         # normal pace. If they have not re-authed yet it costs one token
         # request per click, floored at MIN_POLL_GAP.
         account.wake_floor = MIN_POLL_GAP
+        try:
+            write_error(account, str(e))
+        except (OSError, ValueError) as io_error:
+            print(f"kclaude-daemon: {account.label}: could not record the error in "
+                  f"{account.usage_file} ({io_error})", file=sys.stderr)
     except Exception as e:
         print(f"kclaude-daemon: {account.label}: {e}", file=sys.stderr)
         # Exponential backoff so a rate limit or an outage is not hammered.
@@ -1104,7 +1408,12 @@ def poll_account(account, interval):
         # While backing off, a refresh request must not short-circuit the wait:
         # that is exactly how one 429 becomes a hammer.
         account.wake_floor = delay
-    account.next_due = now + delay
+    finally:
+        # last, and unconditionally: every path above sets delay, and the one
+        # thing that must always happen is that this account is scheduled again.
+        # The jitter only ever lengthens a wait, so it cannot become a way round
+        # the floors above.
+        account.next_due = now + delay + account.jitter
 
 
 def seconds_until_next(accounts):
@@ -1185,6 +1494,13 @@ def reload_accounts(accounts):
     every account's state files would strand the numbers the widget is reading.
     """
     state_dir = accounts[0].state_dir if accounts else None
+    if accounts_file_state() == "unreadable":
+        # Failing closed. The file is there and cannot be parsed, which is a
+        # transient or damaged state -- not a decision to watch ~/.claude. The
+        # accounts already loaded keep being polled exactly as they were.
+        print(f"kclaude-daemon: {ACCOUNTS_FILE} is present but unreadable; "
+              f"keeping the {len(accounts)} account(s) already running", file=sys.stderr)
+        return accounts
     fresh = load_accounts(state_dir)
     if accounts_signature(fresh) == accounts_signature(accounts):
         return accounts
@@ -1202,7 +1518,17 @@ def reload_accounts(accounts):
 
 def main():
     interval = parse_interval(sys.argv)
-    if single_instance_lock() is None:
+    try:
+        lock = single_instance_lock()
+    except OSError as e:
+        # The one permanent condition this has: an unwritable state directory.
+        # Exit 0 for the same reason the other exit below does -- a condition
+        # that will still be there in 30 seconds must not become a restart loop,
+        # and a traceback says less than the path and the errno do.
+        print(f"kclaude-daemon: cannot use the lock file in {STATE_DIR} ({e}); not starting",
+              file=sys.stderr)
+        return
+    if lock is None:
         # Exit 0: this is the expected outcome of starting a second copy, not a
         # failure for systemd to restart in a loop.
         print("kclaude-daemon: another instance is already running, exiting", file=sys.stderr)
@@ -1219,9 +1545,23 @@ def main():
             # Per account rather than one shared cadence, so a fresh account is
             # picked up on the next pass and a backed-off one is simply skipped.
             if now >= account.next_due:
-                poll_account(account, interval)
-        # Jitter avoids lockstep retries across restarts.
-        woke = waker.wait(seconds_until_next(accounts) + random.uniform(0, 15))
+                # Belt and braces. poll_account already contains its own
+                # failures; this is here so that no future edit inside it can
+                # take the process down and stop every *other* account too. The
+                # per-account backoff still decides when this one is retried.
+                try:
+                    poll_account(account, interval)
+                except Exception as e:
+                    print(f"kclaude-daemon: {account.label}: unhandled error in poll ({e})",
+                          file=sys.stderr)
+                    account.backoff = min(account.backoff * 2, MAX_BACKOFF)
+                    account.wake_floor = account.backoff
+                    account.next_due = time.monotonic() + account.backoff
+        # Jitter avoids lockstep retries across restarts. Per account, and folded
+        # into each one's own schedule rather than added to the sleep: adding it
+        # here made every effective interval 60-75s instead of the 60s the
+        # README and the settings page both promise.
+        woke = waker.wait(seconds_until_next(accounts))
 
         if signal.SIGUSR2 in woke:
             # The widget saw a five-hour window run out and wants the next one
@@ -1251,6 +1591,43 @@ def selftest():
     # Missing, null and non-dict windows are dropped rather than written as 0%.
     assert normalize_windows({"five_hour": {"utilization": None}, "seven_day": None}) == {}
     assert normalize_windows({}) == {}
+
+    # --- the shared id table -------------------------------------------------
+    #
+    # tests/fixtures/slugs.json is read by this and by tests/accounts.test.js, so
+    # what is pinned is that the two implementations of the id rule *agree*.
+    # Each was previously tested against itself, which is the one direction in
+    # which they can diverge: Python's str.isalnum() is Unicode-aware and the JS
+    # regex is not, so "café" became "café" here and "caf" there and the widget
+    # watched a file the collector never wrote. Nothing was red.
+    slug_fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                os.pardir, "tests", "fixtures", "slugs.json")
+    if os.path.exists(slug_fixture):
+        with open(slug_fixture) as f:
+            slugs = json.load(f)
+        assert slugs["maxLength"] == MAX_ID_LENGTH, (slugs["maxLength"], MAX_ID_LENGTH)
+        for case in slugs["cases"]:
+            got = account_id(case["in"])
+            assert got == case["out"], (case["in"], got, case["out"])
+            # The id is part of a filename, so it must fit one. 11 bytes of
+            # affix plus a 255-byte NAME_MAX is the hard ceiling; the cap here
+            # is well inside it and the same on the other side.
+            assert len(got.encode()) <= 244, (case["in"], got)
+        for value in slugs["nonStrings"]:
+            # Not coerced. A number is not an id, and inventing one here would
+            # put a row on the panel the other half has dropped.
+            assert account_id(value) == "", (value, account_id(value))
+    else:
+        raise AssertionError(f"the shared id table is missing: {slug_fixture}")
+
+    # The cap exists because an over-long id produced a filename past NAME_MAX,
+    # after which every write for that account failed with ENAMETOOLONG and the
+    # poll's backoff turned that into "this account silently shows nothing for
+    # ever" with one line in the journal.
+    assert len(account_id("a" * 5000)) == MAX_ID_LENGTH
+    assert account_id("café") == "caf", account_id("café")
+    assert account_id("клиент") == "", account_id("клиент")
+
     assert token_expired({"expiresAt": 0})
     assert not token_expired({"expiresAt": (time.time() + 3600) * 1000})
     assert not token_expired({})  # unknown expiry -> let the 401 path handle it
@@ -1543,12 +1920,85 @@ def selftest():
     assert exhausted_until(
         {"seven_day": {"utilization": 100.0, "resets_at": "2026-08-03T05:00:00Z"}},
         now) == FIVE_HOURS
-    # A reset already in the past means wake now, not a negative sleep.
+    # A reset already in the past means wake soon -- but "soon" is bounded by
+    # this daemon's own floor. It used to be exactly RESET_SLACK (10s), which is
+    # below MIN_POLL_GAP and six times below MIN_INTERVAL, so a clock skew, a
+    # stale header or a naive resets_at on a machine east of UTC turned a spent
+    # window into a 10-second ping loop against an endpoint that was refusing.
     assert exhausted_until(
         {"five_hour": {"utilization": 100.0, "resets_at": "2026-07-30T04:00:00Z"}},
         now) == RESET_SLACK
     # Exhausted with an unusable reset time still waits, rather than spinning.
     assert exhausted_until({"five_hour": {"utilization": 100.0}}, now) == MAX_BACKOFF
+
+    # A NaN utilization reads as "not >= 100.0" in the wrong direction: every
+    # comparison against NaN is False, so `utilization < 100.0` alone treated a
+    # NaN window as spent and put the account to sleep for the whole window, with
+    # a wake_floor a manual Refresh could not pull it out of.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert exhausted_until({"five_hour": {"utilization": bad,
+                                              "resets_at": "2026-07-30T05:20:00Z"}},
+                               now) is None, bad
+    # ...and the same value must never reach the file, where json.dumps writes a
+    # bare NaN token that is not JSON and that QML's JSON.parse rejects.
+    assert normalize_window({"utilization": float("nan"), "resets_at": "T"}) is None
+    assert normalize_window({"utilization": float("inf"), "resets_at": "T"}) is None
+    # Out of contract on the other side too: a bar pinned at full beside a label
+    # reading "550%" is the widget drawing two things that disagree.
+    assert normalize_window({"utilization": 550, "resets_at": "T"})["utilization"] == 1.0
+    assert normalize_window({"utilization": -5, "resets_at": "T"})["utilization"] == 0.0
+    # bool is an int subclass, and utilization: true is not a percentage.
+    assert normalize_window({"utilization": True, "resets_at": "T"}) is None
+
+    # iso() is total. Every caller parses a response nobody promised was well
+    # formed, and an OverflowError here took the whole poll down instead of
+    # dropping the one field that was wrong.
+    assert iso(float("nan")) is None
+    assert iso(1e300) is None
+    assert iso("not a number") is None
+    assert iso(0).endswith("Z")
+
+    # parse_iso() exists so the daemon's own "Z" output is readable on every
+    # supported interpreter. datetime.fromisoformat only learned the trailing Z
+    # in 3.11, and on anything older every reset time here failed to parse --
+    # silently, because the failure is swallowed -- degrading the entire
+    # go-quiet-until-reset design into a flat one-hour backoff.
+    assert parse_iso("2026-07-30T05:20:00Z") == now + 20 * 60
+    assert parse_iso("2026-07-30T05:20:00+00:00") == now + 20 * 60
+    # A value with no offset is read as UTC, matching iso()'s output.
+    assert parse_iso("2026-07-30T05:20:00") == now + 20 * 60
+    # The scoped endpoint's own form, with six fractional digits.
+    assert parse_iso("2026-09-29T19:59:59.622752+00:00") is not None
+    for bad in (None, "", "T", 42, "2026-13-45T99:99:99Z"):
+        assert parse_iso(bad) is None, bad
+
+    # usage_from_headers parses each field independently. Sharing one try meant a
+    # fractional reset epoch -- "1759...0.0", which servers do send -- threw away
+    # a utilization that had already parsed, and since a one-window dict is
+    # still truthy, collect saw a reply and never fell back to the endpoint. The
+    # five-hour bar simply vanished from the panel with nothing said.
+    fractional = usage_from_headers({
+        "anthropic-ratelimit-unified-5h-utilization": "0.5",
+        "anthropic-ratelimit-unified-5h-reset": "1759000000.5",
+    })
+    assert "five_hour" in fractional, fractional
+    assert fractional["five_hour"]["utilization"] == 50.0, fractional
+    # The reverse: a reset that will not parse drops that field, not the window.
+    assert usage_from_headers({
+        "anthropic-ratelimit-unified-5h-utilization": "0.5",
+        "anthropic-ratelimit-unified-5h-reset": "not-a-number",
+    }) == {}
+    # Non-finite utilization is refused here rather than at json.dumps, where it
+    # would become a token the widget's parser rejects.
+    assert usage_from_headers({
+        "anthropic-ratelimit-unified-5h-utilization": "nan",
+        "anthropic-ratelimit-unified-5h-reset": "1759000000",
+    }) == {}
+    assert usage_from_headers({
+        "anthropic-ratelimit-unified-5h-utilization": "inf",
+        "anthropic-ratelimit-unified-5h-reset": "1759000000",
+    }) == {}
+
 
     class FakeErr:
         headers = {"Retry-After": "120"}
@@ -1561,8 +2011,9 @@ def selftest():
     assert retry_after(RuntimeError("no headers"), 60) == 60
 
     # The file format is the contract with FileUsageProvider.qml, which reads
-    # windows[*].utilization, windows[*].resetAt and updatedAt. Changing a key
-    # here silently blanks the widget, so pin the shape.
+    # windows[*].utilization, windows[*].resetAt, updatedAt and -- to refuse a
+    # file that belongs to a different account -- account. Changing a key here
+    # silently blanks the widget, so pin the shape.
     with tempfile.TemporaryDirectory() as d:
         acct = Account({"id": "solo", "label": "Solo", "path": os.path.join(d, "cfg")}, 0, d)
         acct.plan = "max"
@@ -1571,8 +2022,9 @@ def selftest():
             "seven_day": {"utilization": 41.5, "resets_at": "2026-08-03T00:00:00Z"},
         })
         written = json.load(open(acct.usage_file))
-        assert set(written) == {"windows", "updatedAt", "plan"}, written
+        assert set(written) == {"windows", "updatedAt", "plan", "account"}, written
         assert written["plan"] == "max"
+        assert written["account"] == "solo"
         assert set(written["windows"]) == {"five_hour", "seven_day"}, written
         for w in written["windows"].values():
             assert set(w) == {"utilization", "resetAt"}, w
@@ -1593,11 +2045,48 @@ def selftest():
         bare = Account({"id": "bare", "path": os.path.join(d, "cfg2")}, 0, os.path.join(d, "fresh"))
         write_error(bare, "no creds")
         fresh = json.load(open(bare.usage_file))
-        assert set(fresh) == {"windows", "updatedAt", "error"}, fresh
+        assert set(fresh) == {"windows", "updatedAt", "error", "account"}, fresh
         assert fresh["windows"] == {}
         # An account whose plan is not known writes no plan key at all, so a
         # hand-written or pre-plan file keeps parsing.
         assert "plan" not in json.load(open(bare.usage_file))
+
+        # allow_nan=False. A NaN reaching json.dumps would be written as a bare
+        # token that is not JSON at all, and QML's JSON.parse -- which has no
+        # NaN literal, per ECMA-262 -- rejects the whole document, taking the
+        # account to "Collector Offline" with the last good numbers still on
+        # disk. Refusing to write turns that into a ValueError, which the poll's
+        # existing backoff already handles: a wrong number must not become a
+        # lost file.
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            try:
+                write_usage(acct, {"five_hour": {"utilization": bad, "resets_at": "T"}})
+                raise AssertionError(f"write_usage accepted a non-finite utilization: {bad}")
+            except ValueError:
+                pass
+        # And the file it refused to damage still holds the last good numbers --
+        # which for this account is the 10% written a case above, not the 68%
+        # from the first one.
+        still_good = json.load(open(acct.usage_file))["windows"]["five_hour"]["utilization"]
+        assert still_good == 0.10, still_good
+
+        # The scoped cache records which account owns it. The file name is
+        # derived from the account's *position* in the list, so reordering the
+        # settings page points a slot at a different account's file -- and
+        # without this the account that moved adopted its new neighbour's Fable
+        # window and published another account's percentage under its own name.
+        hoarder = Account({"id": "hoarder", "path": os.path.join(d, "hoarder")}, 0, d)
+        hoarder.scoped._windows = {"fable": {"utilization": 22, "resets_at": "T"}}
+        hoarder.scoped._fetched_at = 123.0
+        hoarder.scoped._save()
+        assert json.load(open(hoarder.scoped_file))["account"] == "hoarder"
+        # A reader that is a different account discards it rather than believes it.
+        thief = Account({"id": "thief", "path": os.path.join(d, "thief")}, 0, d)
+        thief.scoped.set_path(hoarder.scoped_file)
+        assert thief.scoped._windows == {}, thief.scoped._windows
+        # The rightful owner still reads it back.
+        hoarder.scoped.set_path(hoarder.scoped_file)
+        assert hoarder.scoped._windows == {"fable": {"utilization": 22, "resets_at": "T"}}
 
         # With a scoped window in the mix, the file gains exactly one key on
         # exactly one window, and the file-level updatedAt is untouched by it.
@@ -1608,7 +2097,7 @@ def selftest():
              "scope": {"model": {"display_name": "Fable"}}}]})
         write_usage(scoped_acct, {"five_hour": {"utilization": 82, "resets_at": "2026-09-27T16:29:59Z"}}, sc)
         merged = json.load(open(scoped_acct.usage_file))
-        assert set(merged) == {"windows", "updatedAt"}, merged
+        assert set(merged) == {"windows", "updatedAt", "account"}, merged
         assert set(merged["windows"]) == {"five_hour", "fable"}, merged
         assert set(merged["windows"]["five_hour"]) == {"utilization", "resetAt"}
         assert set(merged["windows"]["fable"]) == {"utilization", "resetAt", "updatedAt"}
@@ -1644,6 +2133,55 @@ def selftest():
         absent = Account({"id": "absent", "path": os.path.join(d, "absent-cfg")}, 1, d)
         save_oauth(absent, {"accessToken": "fresh"})
         assert json.load(open(absent.credentials_file)) == {"claudeAiOauth": {"accessToken": "fresh"}}
+
+        # Keys *inside* claudeAiOauth are Claude Code's too, and the successful
+        # merge above never noticed because the test object had none. scopes,
+        # subscriptionType and rateLimitTier all live there, and the plan badge
+        # is read straight out of subscriptionType.
+        nested = Account({"id": "nested", "path": os.path.join(d, "nested-cfg")}, 0, d)
+        write_atomic(nested.credentials_file, json.dumps({
+            "claudeAiOauth": {"accessToken": "old", "scopes": ["user:inference"],
+                              "subscriptionType": "max", "expiresAt": 1},
+            "mcpOAuth": {"keep": "me"},
+        }), mode=0o600)
+        save_oauth(nested, {"accessToken": "new", "refreshToken": "r2", "expiresAt": 2})
+        nested_after = json.load(open(nested.credentials_file))["claudeAiOauth"]
+        assert nested_after == {"accessToken": "new", "refreshToken": "r2", "expiresAt": 2,
+                                "scopes": ["user:inference"], "subscriptionType": "max"}, nested_after
+
+        # An unreadable file is not an empty one. This is the case that used to
+        # delete mcpOAuth and organizationUuid: a read that failed for a
+        # transient reason -- Claude Code caught mid-write, a truncated file, a
+        # momentary EIO -- was answered with {} and the whole file was rewritten.
+        # The docstring and the README both promised this could not happen, and
+        # the selftest only ever pinned the *missing* file, where the lossy
+        # behaviour is harmless.
+        damaged = Account({"id": "damaged", "path": os.path.join(d, "damaged-cfg")}, 0, d)
+        write_atomic(damaged.credentials_file,
+                     '{"claudeAiOauth": {"accessToken": "trunc', mode=0o600)
+        before = open(damaged.credentials_file).read()
+        try:
+            save_oauth(damaged, {"accessToken": "new"})
+            raise AssertionError("a damaged credentials file must not be written over")
+        except ValueError:
+            pass
+        assert open(damaged.credentials_file).read() == before, "the file must be left exactly as it was"
+
+        # A compare-and-swap on the refresh token we sent. Claude Code
+        # re-authenticating underneath an in-flight refresh used to have its new
+        # login overwritten by our reply for the old one, leaving a hybrid file.
+        swapped = Account({"id": "swapped", "path": os.path.join(d, "swapped-cfg")}, 0, d)
+        write_atomic(swapped.credentials_file, json.dumps({
+            "claudeAiOauth": {"accessToken": "mine", "refreshToken": "one-I-sent"},
+            "organizationUuid": "org-x",
+        }), mode=0o600)
+        assert save_oauth(swapped, {"accessToken": "fresh", "refreshToken": "rotated"},
+                          expected_refresh="something-else") is False
+        assert json.load(open(swapped.credentials_file))["claudeAiOauth"]["accessToken"] == "mine"
+        # The matching case does write.
+        assert save_oauth(swapped, {"accessToken": "fresh", "refreshToken": "rotated"},
+                          expected_refresh="one-I-sent") is True
+        assert json.load(open(swapped.credentials_file))["claudeAiOauth"]["accessToken"] == "fresh"
 
         # The one isolation property the whole refactor exists for: refreshing
         # one account's token must not put it in another account's file. Two
@@ -1795,6 +2333,40 @@ def selftest():
             assert len(capped) == MAX_ACCOUNTS, len(capped)
             assert capped[0].id == "a0"
 
+            # The cap is on how many accounts are *kept*, not how many entries
+            # are read. Slicing the input meant a file whose first MAX_ACCOUNTS
+            # entries were all unusable fell through to the default account
+            # even when entry nine was perfectly good -- and the widget, which
+            # caps its own output, disagreed with the collector about which rows
+            # exist at all.
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts":
+                [{"id": "", "path": ""}] * MAX_ACCOUNTS
+                + [{"id": "survivor", "path": os.path.join(d, "good")}]}))
+            rescued = load_accounts(d)
+            assert [a.id for a in rescued] == ["survivor"], [a.id for a in rescued]
+
+            # A damaged accounts.json is not a decision to watch ~/.claude. The
+            # collector used to reload from it and repoint every account at the
+            # default on the next pass, which also means refreshing a token the
+            # user may not have chosen.
+            write_atomic(ACCOUNTS_FILE, '{"accounts": [{"id": "x", "path"')
+            assert accounts_file_state() == "unreadable"
+            kept = load_accounts(d)
+            with quiet():
+                # Failing closed: the list already running is kept, unchanged.
+                same = reload_accounts(rescued)
+            assert [a.id for a in same] == ["survivor"], [a.id for a in same]
+            # Absent is a different thing, and still means the default account.
+            os.unlink(ACCOUNTS_FILE)
+            assert accounts_file_state() == "missing"
+            assert load_accounts(d)[0].id == "claude"
+            # Left with the list the cases below go on to use, which is the one
+            # they were written against rather than whatever this block ended on.
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts": [
+                {"id": "a0", "path": os.path.join(d, "c0")},
+                {"id": "a1", "path": os.path.join(d, "c1")},
+                {"id": "a2", "path": os.path.join(d, "c2")}]}))
+
             # A rename or a reorder keeps the running account's pacing and cache: a
             # fresh object would reset an hour of error backoff and spend an
             # endpoint call the previous poll already earned the right to spend.
@@ -1943,6 +2515,49 @@ def selftest():
             finally:
                 ping_usage = real_ping_account
             assert spent_acct.next_due > time.monotonic() + 60, spent_acct.next_due
+
+            # A spent window whose reset has *already passed* -- a clock skew, a
+            # stale header, a naive resets_at read on a machine east of UTC --
+            # used to be polled every RESET_SLACK (10s). That is below this
+            # daemon's own MIN_POLL_GAP and six times below MIN_INTERVAL, so the
+            # one behaviour this file exists to avoid, pinging into a refusal,
+            # was reachable by nothing more than a wrong timestamp.
+            stale_acct = Account({"id": "stale", "path": os.path.join(d, "stale")}, 0, d)
+            past_reset = iso(time.time() - 3600)
+            try:
+                ping_usage = lambda _a: {"five_hour": {"utilization": 100.0,
+                                                        "resets_at": past_reset}}
+                poll_account(stale_acct, 60)
+            finally:
+                ping_usage = real_ping_account
+            assert stale_acct.wake_floor >= MIN_POLL_GAP, stale_acct.wake_floor
+            assert stale_acct.next_due - time.monotonic() >= MIN_POLL_GAP, stale_acct.next_due
+
+            # No path through a poll may schedule this daemon faster than
+            # MIN_POLL_GAP, whatever the numbers say.
+            for account in (good, bad, spent_acct, stale_acct):
+                assert account.next_due - time.monotonic() >= MIN_POLL_GAP, account.id
+
+            # poll_account promises "Never raises" so that one account's dead
+            # login cannot stop the other updating. Its own AuthError handler
+            # used to do unguarded I/O, so one unwritable state directory plus
+            # one expired login took down every account, and Restart=on-failure
+            # with RestartSec=30 turned that into a loop.
+            unwritable = Account({"id": "unwritable", "path": os.path.join(d, "unwritable")}, 0,
+                                 os.path.join(d, "no-such-state-dir"))
+            # Point the state dir at a path that cannot be a directory, so every
+            # write inside it fails with a plain OSError.
+            os.makedirs(os.path.join(d, "blocked"), exist_ok=True)
+            unwritable.state_dir = os.path.join(d, "blocked", "not-a-dir")
+            try:
+                ping_usage = lambda _a: (_ for _ in ()).throw(AuthError("login expired"))
+                poll_account(unwritable, 60)  # must not raise
+            finally:
+                ping_usage = real_ping_account
+            # The schedule is still set, which is the part that matters: the
+            # account is retried rather than left with a stale next_due.
+            assert unwritable.next_due > time.monotonic() + MIN_POLL_GAP, unwritable.next_due
+            assert unwritable.backoff >= 60, unwritable.backoff
 
 
     print("selftest ok")

@@ -23,10 +23,18 @@ MouseArea {
 
     readonly property bool _multiAccount: usageModels.length > 1
 
-    Layout.minimumWidth: layout.implicitWidth + _padding
-    Layout.maximumWidth: layout.implicitWidth + _padding
+    // A ceiling on what this item may take from the panel. With one account the
+    // text is short and this never binds; with eight, the joined row can be
+    // wide enough to push everything else off the panel, and a panel item that
+    // grows without bound is a layout bug the user fixes by removing accounts.
+    // The label elides, so the row degrades to "82% · 0% …" rather than the
+    // panel shrinking to nothing.
+    readonly property int _maxWidth: Kirigami.Units.gridUnit * 24
+
+    Layout.minimumWidth: Math.min(_maxWidth, layout.implicitWidth + _padding)
+    Layout.maximumWidth: Math.min(_maxWidth, layout.implicitWidth + _padding)
     Layout.minimumHeight: Kirigami.Units.iconSizes.small
-    implicitWidth: layout.implicitWidth + _padding
+    implicitWidth: Math.min(_maxWidth, layout.implicitWidth + _padding)
     implicitHeight: Kirigami.Units.iconSizes.small
 
     hoverEnabled: true
@@ -101,6 +109,7 @@ MouseArea {
             case "warning": return Kirigami.Theme.neutralTextColor
             case "critical": return Kirigami.Theme.negativeTextColor
             case "limit_reached": return Kirigami.Theme.negativeTextColor
+            case "sleeping": return Kirigami.Theme.disabledTextColor
             default: return Kirigami.Theme.disabledTextColor
         }
     }

@@ -1,0 +1,136 @@
+{
+  "_comment": [
+    "The id rule, as a table both ends of the contract are checked against.",
+    "",
+    "account_id() in daemon/kclaude-daemon and Accounts.slug in",
+    "contents/code/Accounts.js are the same rule written twice, in two",
+    "languages, and the id is part of a filename on both sides. They are read",
+    "here by the collector's --selftest and by tests/accounts.test.js, so what",
+    "is under test is the agreement between the two implementations and not",
+    "each one against itself -- which is how 'cafe' with an acute accent came",
+    "to be the accented form on the collector's side and the unaccented one on",
+    "the widget's, silently, while both suites stayed green.",
+    "",
+    "Cases marked cross_language are the ones that used to disagree.",
+    "Anything here that is not a plain ASCII string is load-bearing."
+  ],
+  "maxLength": 64,
+  "cases": [
+    {
+      "in": "Claude Dad",
+      "out": "claude_dad"
+    },
+    {
+      "in": "work",
+      "out": "work"
+    },
+    {
+      "in": "  spaced  ",
+      "out": "spaced"
+    },
+    {
+      "in": "a-b",
+      "out": "a_b"
+    },
+    {
+      "in": "a b",
+      "out": "a_b"
+    },
+    {
+      "in": "a__b",
+      "out": "a_b"
+    },
+    {
+      "in": "_leading",
+      "out": "leading"
+    },
+    {
+      "in": "trailing_",
+      "out": "trailing"
+    },
+    {
+      "in": "___",
+      "out": ""
+    },
+    {
+      "in": "",
+      "out": ""
+    },
+    {
+      "in": "...",
+      "out": ""
+    },
+    {
+      "in": "123",
+      "out": "123"
+    },
+    {
+      "in": "Mixed Case 42!",
+      "out": "mixed_case_42"
+    },
+    {
+      "in": ".claude-dad",
+      "out": "claude_dad"
+    },
+    {
+      "in": "v1.2.3",
+      "out": "v1_2_3"
+    },
+    {
+      "in": "café",
+      "out": "caf",
+      "cross_language": true
+    },
+    {
+      "in": "naïve",
+      "out": "na_ve",
+      "cross_language": true
+    },
+    {
+      "in": "клиент",
+      "out": "",
+      "cross_language": true
+    },
+    {
+      "in": "日本",
+      "out": "",
+      "cross_language": true
+    },
+    {
+      "in": "Ｃａｆｅ",
+      "out": "",
+      "cross_language": true
+    },
+    {
+      "in": "emoji-🎉",
+      "out": "emoji",
+      "cross_language": true
+    },
+    {
+      "in": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "out": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "length_cap": true
+    },
+    {
+      "in": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "out": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "length_cap": true
+    },
+    {
+      "in": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-tail",
+      "out": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "length_cap": true
+    }
+  ],
+  "nonStrings": [
+    42,
+    null,
+    true,
+    [
+      "work"
+    ],
+    {
+      "id": "work"
+    }
+  ]
+}

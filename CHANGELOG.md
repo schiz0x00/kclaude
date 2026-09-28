@@ -8,6 +8,118 @@ from `metadata.json`, and pushing a `v*` tag builds and attaches the
 
 ## [Unreleased]
 
+### Fixed
+
+A top-to-bottom audit found a lot of these, and a few of them are severe enough
+to lead with. The test suite was fully green throughout: the failures below were
+in paths no test drove.
+
+**The Accounts settings page could destroy your account list.** The page
+instantiated its `AccountList` with no `Component.onCompleted: refresh()`, so
+the read was never started, the working copy stayed empty, and pressing OK
+wrote `{"accounts": []}` over `accounts.json`. Both halves then read that as
+"no accounts" and fell back to `~/.claude` — silently, with a journal line only.
+`save()` is now gated on a read having actually completed, so an unread list can
+never be written back as an empty one.
+
+**"Add folder…" could not add anything.** It runs `test -f`, which exits 0 and
+prints nothing, and the one-shot reader treated empty output as failure by
+default. A valid folder was reported as having no `.credentials.json` and the
+code that adds the account never ran. The default is now the other way round —
+a command's contract is its exit status — and only the two callers that really
+read a document opt in.
+
+**A spent limit could be pinged every ten seconds.** When a window's reset time
+had already passed — a clock skew, a stale header — the wait clamped to exactly
+the ten-second slack constant, which is below the collector's own 30-second
+floor. It now waits at least `MIN_POLL_GAP`. A weekly limit has the same shape of
+problem and it is the reason the collector stops polling at all.
+
+**A malformed number could take an account offline.** `NaN` from a rate-limit
+header passed every range check, was written into `usage.json` as a bare `NaN`
+token — which is not JSON, and which the widget's parser rejects — and, because
+every comparison against `NaN` is false, was also read as "limit spent", so the
+collector slept for the whole window and a manual Refresh could not pull it out.
+Refused at every layer now, ending at `json.dumps(..., allow_nan=False)`.
+
+**The collector could delete Claude Code's own credentials.** When the
+read-before-write of `.credentials.json` failed for any reason other than the
+file being absent, the merge answered `{}` and rewrote the file, dropping
+`mcpOAuth` and `organizationUuid`. A transient parse error — Claude Code caught
+mid-write — was enough. An unreadable file is not an empty one now. Related: a
+successful refresh whose *write* failed used to lose a token the server had
+already rotated, which costs the user their login.
+
+**Non-ASCII account ids silently split the two halves.** The collector
+slugified with Python's `str.isalnum()`, which is Unicode-aware; the widget used
+an ASCII-only regex. `café` became `café` in one and `caf` in the other, so the
+panel watched a file the collector never wrote. Both sides now share one
+fixture table, and the same table pins a 64-character cap: an over-long id
+overflowed `NAME_MAX`, after which every write for that account failed and it
+showed nothing for ever.
+
+**A failed poll could stop the collector entirely.** The auth-error path wrote
+its diagnostic with nothing around it, so an unwritable state directory plus one
+expired login killed the process and every account with it — and
+`Restart=on-failure` turned that into a 30-second loop. Also: an unwritable lock
+file no longer raises out of startup.
+
+**The collector's service state could freeze for a whole session.** The three
+`systemctl` calls used raw data sources with neither the coalescing nor the
+watchdog that the rest of the widget has, so one lost callback held a source
+name forever, and the refresh and prime calls went on reporting success —
+permanently disarming session priming — with nothing said.
+
+### Added
+
+- `usage.json` carries an optional `account` key. The filename follows the
+  account's *position* in the list, so reordering moves a filename between
+  accounts for a poll interval; this key does not, and the widget refuses a
+  file that names a different account rather than drawing it. Files without the
+  key are unaffected.
+- The panel and popup now re-read `accounts.json` on their own slow cadence and
+  when the popup opens, so an account added in the settings shows up without
+  restarting plasmashell. An unchanged re-read costs nothing.
+- The popup distinguishes **"Waiting for a limit to reset"** from **"Collector
+  Offline"**. The collector deliberately stops polling a spent window for hours;
+  that was indistinguishable from a crash, and the grey dot was the only
+  feedback.
+- The popup now shows *why* a file could not be read, and whatever `systemctl`
+  last reported. Both were computed and then never displayed.
+- CI runs the collector's selftest on Python 3.9, 3.11 and 3.14, and lints it
+  with ruff. The collector declares only "python3", so the oldest interpreter
+  anyone is likely to run is part of the contract — and it was not for a long
+  time: the daemon's own `…Z` timestamps were unreadable by
+  `datetime.fromisoformat` before 3.11, and every reset time failing to parse
+  silently degraded the whole go-quiet-until-reset design to a one-hour backoff.
+- CI regenerates the translation template and fails when the committed one has
+  drifted. Nothing enforced `docs/i18n.md`'s extraction command, so a new
+  user-facing string written as a bare literal passed every check in the
+  repository and never reached a translator.
+
+### Changed
+
+- Account ids are lowercased and reduced to ASCII letters and digits on both
+  sides, and capped at 64 characters. An install with a hand-edited
+  `accounts.json` whose id contained non-ASCII characters will see that account
+  write to a differently-named file; the old one is left in place, unread.
+- The popup's one-second countdown clock and each account's ten-second
+  "updated" timer now run only while the popup is open. They were running
+  inside plasmashell all day, driving bindings for a closed window.
+- Poll jitter is a per-account offset in that account's own schedule rather than
+  added to the collector's shared sleep, which had stretched every effective
+  interval to 60–75s against a documented 60s.
+- `OneShotReader` caps a single read at 1 MiB and refuses it as a named failure
+  rather than handing back half a document to parse.
+- State files are written 0600 in a 0700 directory, and the rename is followed
+  by a directory fsync. Without it a crash can revert a rotated token to the
+  copy the server has already invalidated.
+- The collector refuses HTTP redirects outright. Python's default redirect
+  handler copies `Authorization` across a 3xx.
+- `docs/architecture.md` no longer claims the plasma5support dependency is
+  confined to two files (it is three, all reached through `OneShotReader`), and
+  several other claims that the code did not support have been corrected.
+
 ## [1.2.0] - 2026-09-27
 
 **Several accounts at once**, and a collector that reads usage from the

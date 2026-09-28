@@ -17,6 +17,11 @@ RowLayout {
             case "warning": return Kirigami.Theme.neutralTextColor
             case "critical": return Kirigami.Theme.negativeTextColor
             case "limit_reached": return Kirigami.Theme.negativeTextColor
+            // Same grey as an outage, deliberately: neither is reporting right
+            // now, and the two differ only in the label beside the dot. A
+            // distinct hue here would read as a third severity level that means
+            // nothing.
+            case "sleeping": return Kirigami.Theme.disabledTextColor
             default: return Kirigami.Theme.disabledTextColor
         }
     }

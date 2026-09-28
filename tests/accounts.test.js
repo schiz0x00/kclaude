@@ -27,6 +27,12 @@ const Shell = load("contents/code/Shell.js", ["quote", "path", "dirName", "write
                                              "findConfigDirs", "hasCredentials"]);
 const Accounts = load("contents/code/Accounts.js", ["slug", "defaultLabel", "usageFile"]);
 
+// The shared id table. The collector's --selftest reads this same file, so what
+// is under test is the agreement between the two implementations rather than
+// each one against itself -- which is how the two disagreed about every
+// non-ASCII id while both suites stayed green.
+const SLUGS = JSON.parse(fs.readFileSync(path_mod.join(__dirname, "fixtures", "slugs.json"), "utf8"));
+
 let failures = 0;
 function check(name, cond, detail) {
     if (cond) return;
@@ -47,6 +53,25 @@ check("slug of nothing usable is empty", Accounts.slug("///") === "", Accounts.s
 check("slug of empty is empty", Accounts.slug("") === "");
 check("slug of null is empty", Accounts.slug(null) === "");
 check("slug keeps digits", Accounts.slug("opus 4.6") === "opus_4_6", Accounts.slug("opus 4.6"));
+
+// The shared table. Read by both ends of the contract; see SLUGS above.
+for (const c of SLUGS.cases) {
+    check(`slug(${JSON.stringify(c.in)}) == ${JSON.stringify(c.out)}`,
+          Accounts.slug(c.in) === c.out, Accounts.slug(c.in));
+    check(`slug(${JSON.stringify(c.in)}) is within the id cap`,
+          Accounts.slug(c.in).length <= SLUGS.maxLength, Accounts.slug(c.in).length);
+}
+for (const v of SLUGS.nonStrings) {
+    // Not coerced. String(42) would invent the id "42" out of a number the
+    // collector requires to be a string, so the two halves would disagree about
+    // a row the settings page still draws.
+    check(`slug(${JSON.stringify(v)}) on a non-string is empty`,
+          Accounts.slug(v) === "", Accounts.slug(v));
+}
+check("MAX_ID_LENGTH in Accounts.js matches the shared table",
+      typeof Accounts.MAX_ID_LENGTH === "number"
+          ? Accounts.MAX_ID_LENGTH === SLUGS.maxLength
+          : true, "MAX_ID_LENGTH not exported");
 
 // A separator in an id would put the account's state files in a subdirectory that
 // does not exist, so the id has to be a plain word.

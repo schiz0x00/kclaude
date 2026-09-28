@@ -36,6 +36,19 @@ TestCase {
         return page
     }
 
+    // Push with initial properties, so they are in place before
+    // Component.onCompleted runs. That is the only way to test a read that
+    // happens during construction -- which is the read that was missing.
+    function pushPageWith(props) {
+        while (app.pageStack.depth > 0) {
+            app.pageStack.pop();
+        }
+        var page = app.pageStack.push(Qt.resolvedUrl("../contents/ui/configAccounts.qml"), props)
+        verify(page !== null, "push returned null")
+        wait(100)
+        return page
+    }
+
     function countVisible(item, depth) {
         if (!item || depth > 14 || !item.children) {
             return 0
@@ -186,5 +199,53 @@ TestCase {
         // ".claude-dad" slugs to "claude_dad", the same id the collector derives.
         compare(Accounts.usageFile(page.usageBasePath, page.draft[1].id, 1),
                 "/tmp/mine/usage-claude_dad.json")
+    }
+
+    // --- the real read and write path ---------------------------------------
+    //
+    // Every case above hand-assigns `draft`, which is why none of them noticed
+    // that the read was never started: the AccountList on this page had no
+    // Component.onCompleted: refresh(), so `accounts` kept its initial [], the
+    // draft stayed empty, and pressing OK wrote {"accounts": []} over the
+    // user's real list. Both readers treat that as "no accounts" and fall back
+    // to ~/.claude. The whole suite was green the entire time.
+
+    function test_12_the_page_reads_the_list_it_is_about_to_write() {
+        var path = "/tmp/kclaude-tst-accounts-" + Math.floor(Date.now() / 1000) + ".json"
+
+        // Write a real two-account list, through the page's own save().
+        var writer = pushPage()
+        writer.accountsFilePath = path
+        writer.draft = [
+            { id: "solo", label: "Solo", path: "/home/u/.claude" },
+            { id: "work", label: "Work", path: "/home/u/.claude-work" }
+        ]
+        writer._loadCompleted = true
+        writer.save()
+        wait(2000)
+
+        // A fresh page pointed at the same file, with accountsFilePath supplied
+        // as an initial property so that the read happens during construction --
+        // which is the path that was broken. Calling an explicit reload() here
+        // instead would pass even with Component.onCompleted missing, and that is
+        // exactly what the first version of this test did.
+        var page = pushPageWith({ accountsFilePath: path })
+        wait(2000)
+        compare(page.draft.length, 2, "the page did not read the list it was pointed at")
+        compare(page.draft[0].id, "solo")
+        compare(page.draft[0].label, "Solo")
+        compare(page.draft[1].id, "work")
+        compare(page.draft[1].label, "Work")
+    }
+
+    function test_13_a_list_that_was_never_read_is_not_written_back_as_empty() {
+        var page = pushPage()
+        page.accountsFilePath = "/tmp/kclaude-tst-never-read.json"
+        page.draft = []
+        page._loadCompleted = false
+        page.save()
+        wait(500)
+        verify(page.saveError.length > 0,
+               "a refused save must say so, not write an empty list quietly")
     }
 }

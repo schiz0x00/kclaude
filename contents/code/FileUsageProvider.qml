@@ -7,6 +7,19 @@ Item {
 
     property string filePath: "~/.local/state/kclaude/usage.json"
 
+    // The account this file is supposed to hold. Empty means "do not check",
+    // which is what a hand-written usage file, or one read by a caller with no
+    // account concept, gets.
+    //
+    // The collector names the account inside the file as well as in the
+    // filename, because the filename is derived from the account's position in
+    // the list: reorder the settings page and the *name* moves between accounts
+    // for a poll interval. Comparing the two is what stops that interval from
+    // being drawn as if it were real -- the failure being that one account's
+    // percentage appears under another account's name, in the panel, the
+    // tooltip and the popup, with nothing to say so.
+    property string expectedAccount: ""
+
     // Data older than this means the collector is presumably dead.
     property int staleAfterMs: 15 * 60 * 1000
 
@@ -20,6 +33,12 @@ Item {
     // its contents as untrusted: cap how much of it can reach the panel.
     readonly property int maxWindows: 8
     readonly property int maxNameLength: 32
+    // The id cap, which is a filename limit rather than a display one. It is
+    // deliberately not maxNameLength: the collector's own slug is 64
+    // characters, so truncating an id to 32 here would make every id past that
+    // compare unequal to itself and the account would be refused for ever.
+    // Kept in step with MAX_ID_LENGTH in the collector and Accounts.js.
+    readonly property int maxAccountIdLength: 64
 
     property var lastUsage: null
     property date lastUpdated: new Date(0)
@@ -71,6 +90,10 @@ Item {
     OneShotReader {
         id: fileReader
         timeoutMs: 15000
+        // One of only two callers that really is reading a document: an empty
+        // read here means the file is missing or empty, and there is nothing to
+        // parse. The other is AccountList's reader.
+        expectOutput: true
         onCompleted: function(stdout) { root._parseResponse(stdout) }
         // A non-zero exit is the ordinary "file is not there" case and gets the
         // plain message; a timeout says the engine lost the callback, which is a
@@ -106,7 +129,12 @@ Item {
         // The command is rebuilt every time rather than bound, because filePath is
         // configurable and a binding would go stale against a name the engine has
         // already released.
-        fileReader.command = "cat " + Shell.path(path) + " 2>/dev/null"
+        //
+        // `--` because Shell.path makes the path inert to the *shell* but not to
+        // the program: a configured path of "-n" is quoted perfectly and then
+        // read by cat as "number the lines of stdin", which blocks until the
+        // watchdog fires. A path is a path, so say where options end.
+        fileReader.command = "cat -- " + Shell.path(path) + " 2>/dev/null"
         fileReader.run()
     }
 
@@ -121,6 +149,17 @@ Item {
             var windows = raw.windows
             if (!windows || typeof windows !== "object") {
                 root._handleError("Missing or invalid 'windows' field")
+                return
+            }
+
+            // Only when the collector said which account this is. A file with no
+            // `account` key -- hand-written, or from a collector predating the
+            // key -- is taken at its word, so this stays backward safe in both
+            // directions.
+            var owner = root._sanitize(raw.account || "", root.maxAccountIdLength)
+            if (root.expectedAccount.length > 0 && owner.length > 0
+                    && owner !== root.expectedAccount) {
+                root._handleError("These numbers are for a different account")
                 return
             }
 
@@ -139,7 +178,12 @@ Item {
                 windowList.push({
                     id: id,
                     name: root._windowName(id),
-                    utilization: Math.max(0, win.utilization),
+                    // Clamped at both ends, not just the low one. The contract
+                    // says 0.0-1.0 and UsageBar clamps its own width, so an
+                    // over-range value used to draw a full bar beside a label
+                    // reading "550%" -- the two of them disagreeing on screen
+                    // with nothing to say which is right.
+                    utilization: Math.max(0, Math.min(1, win.utilization)),
                     resetAt: root._sanitize(win.resetAt || "", 40),
                     // How far behind the rest of the file this window is, if the
                     // collector says. Undefined means "same age as the file",

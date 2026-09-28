@@ -44,6 +44,9 @@ Item {
     OneShotReader {
         id: reader
         timeoutMs: 15000
+        // Reading a document, like FileUsageProvider's reader: an absent file is
+        // reported as the single default account below, not as an empty list.
+        expectOutput: true
         onCompleted: function(stdout) { root._applyText(stdout) }
         onFailed: function(reason) {
             // "No such file" is the normal case on a single-account install, and
@@ -58,7 +61,9 @@ Item {
     }
 
     function refresh() {
-        reader.command = "cat " + Shell.path(String(root.filePath || "").trim()) + " 2>/dev/null"
+        // `--` so a configured path that begins with a dash is read as a path
+        // rather than as an option to cat. See FileUsageProvider._startRead.
+        reader.command = "cat -- " + Shell.path(String(root.filePath || "").trim()) + " 2>/dev/null"
         reader.run()
     }
 
@@ -129,7 +134,29 @@ Item {
         return Accounts.usageFile(basePath, id, index)
     }
 
+    // Assign only when something really changed. `accounts` is a property, so
+    // handing it a fresh array fires accountsChanged, which rebuilds every
+    // UsageModel delegate and repaints the panel. That used to be harmless
+    // because the read happened once at startup; the list is now re-read on the
+    // popup and on its own slow timer, so a re-read that finds the same file
+    // has to cost nothing at all.
+    //
+    // Compared field by field rather than serialised, so a path the reader
+    // normalises identically still compares equal.
     function _setAccounts(next) {
+        var current = root.accounts
+        if (current instanceof Array && current.length === next.length) {
+            var same = true
+            for (var i = 0; i < next.length; i++) {
+                if (current[i].id !== next[i].id
+                        || current[i].label !== next[i].label
+                        || current[i].path !== next[i].path) {
+                    same = false
+                    break
+                }
+            }
+            if (same) return
+        }
         root.accounts = next
     }
 

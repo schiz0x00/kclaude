@@ -88,6 +88,46 @@ check("bare tilde passthrough", Shell.path("~") === "~");
 check("mid-path tilde is quoted", Shell.path("/tmp/~/x") === "'/tmp/~/x'");
 check("tilde user not expanded", Shell.path("~root/x") === "'~root/x'");
 
+// --- a quoted path is still an option to the program ------------------------
+//
+// Shell.path makes a path inert to the *shell*: it cannot be word-split,
+// globbed, or expanded into something else. It does nothing about the
+// program, which still parses its arguments. Both widget reads are
+// `cat -- <quoted path>`, and the usage-file path is a free-text field the user
+// typed, so a value like "-n" is a legitimate thing for it to hold.
+//
+// An absolute path cannot trigger this -- "/tmp/x/-n" is a path to cat, not an
+// option -- so the cases below use relative ones, which is what a configured
+// value starting with a dash actually is. Without `--`, cat reads it as an
+// option: "-n" and friends silently produce nothing at all, having numbered
+// the lines of an empty stdin, and "--help" answers with its own help text and
+// exit 0, which the provider then tries to JSON.parse.
+//
+// A file named exactly "-" is deliberately absent: cat special-cases that one
+// to mean stdin even after `--`, so no amount of option parsing protects it.
+// "./-" or an absolute path does, which is outside what this can enforce.
+{
+    const dir = fs.mkdtempSync(path_mod.join(os.tmpdir(), "catdash-"));
+    for (const name of ["-n", "--help", "-b", "-E"]) {
+        fs.writeFileSync(path_mod.join(dir, name), "contents of " + name + "\n");
+        const runIn = (cmd) => execFileSync("bash",
+            ["-c", `cd ${Shell.path(dir)} && ${cmd} < /dev/null`], { encoding: "utf8" });
+        check(`cat -- reads a file named ${JSON.stringify(name)}`,
+              runIn("cat -- " + Shell.path(name)) === "contents of " + name + "\n");
+        // And the unguarded form really is misread, which is why the guard is
+        // there rather than belt and braces.
+        let unguarded;
+        try {
+            unguarded = runIn("cat " + Shell.path(name));
+        } catch (e) {
+            unguarded = "<failed>";
+        }
+        check(`without --, ${JSON.stringify(name)} is not read as a file`,
+              unguarded !== "contents of " + name + "\n", JSON.stringify(unguarded));
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+}
+
 if (failures) {
     console.error(`\n${failures} failure(s)`);
     process.exit(1);

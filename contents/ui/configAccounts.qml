@@ -73,11 +73,25 @@ KCM.SimpleKCM {
     CodeModule.AccountList {
         id: loader
         filePath: page.accountsFilePath
+        // Load on construction, exactly as contents/ui/main.qml does. Without
+        // this line the read is simply never started: AccountList has no
+        // self-start, `accounts` keeps its initial [], and every handler below
+        // that copies it into the draft has nothing to copy.
+        Component.onCompleted: refresh()
         onAccountsChanged: {
+            page._loadCompleted = true
             page.draft = JSON.parse(JSON.stringify(accounts))
             planProbe.start()
         }
     }
+
+    // Whether a read has actually landed. Not "draft is empty": an empty list is
+    // a perfectly good answer (a file that lists nothing), and a read that never
+    // happened looks exactly the same. save() is gated on this, so an unread
+    // list can never be written back as an empty one -- which is the one thing
+    // this page must not do, since the list it writes is the only record of the
+    // user's accounts and their labels.
+    property bool _loadCompleted: false
 
     // --- what the collector thinks of each one -----------------------------
     //
@@ -127,13 +141,29 @@ KCM.SimpleKCM {
     Connections {
         target: usageReader
         function onUsageUpdated() {
-            if (usageReader.isOffline) return
-            planProbe.plan[planProbe.entryId] = usageReader.plan
+            // An unreadable file is an account whose plan is not known *yet*,
+            // not a reason to stop the sweep. Returning here without advancing
+            // abandoned the whole probe on the first account with no usage file
+            // -- which is the normal state for accounts 2..N before the
+            // collector's first poll -- and every account after it then showed
+            // no badge, with nothing anywhere saying why. OneShotReader's
+            // watchdog guarantees this signal arrives either way, so the index
+            // always advances and the sweep always terminates.
+            planProbe.plan[planProbe.entryId] = usageReader.isOffline
+                ? "" : usageReader.plan
             // The next one only after this read has landed, so the reads cannot
             // overlap and overwrite each other's entry.
             planProbe.index++
             planProbe.runNext()
         }
+    }
+
+    // Re-run the probe whenever the working copy changes. planProbe.index is a
+    // position in `draft`, and a row moved or removed shifts every position
+    // after it -- so a badge left over from before the edit would be filed
+    // under whichever account landed there next.
+    function _reprobe() {
+        planProbe.start()
     }
 
     // --- writing ------------------------------------------------------------
@@ -153,7 +183,22 @@ KCM.SimpleKCM {
 
     // Plasma calls this when the dialog is accepted. The cfg_* properties are
     // handled by SimpleKCM itself; the account list is ours to persist.
+    //
+    // Gated on a read having landed. An empty draft is a legitimate state -- a
+    // file that really does list no accounts, or one the user emptied on purpose
+    // -- but so is "the read never finished", and the two are indistinguishable
+    // from `draft` alone. Writing on the second would turn a transient read
+    // failure into a destroyed configuration, so it is refused and said out
+    // loud. Everything else on this page is editable in the meantime.
     function save() {
+        if (!page._loadCompleted) {
+            page.saveError = page._tr("The account list has not been read yet; nothing was written. " +
+                                      "Close and reopen this page and try again.")
+            // The dialog is closing around us, so the message above may not be
+            // seen. The journal is the one channel that survives it.
+            console.warn("kclaude: accounts.json was never read; refusing to write an empty account list")
+            return
+        }
         var payload = {
             version: 1,
             accounts: page.draft.map(function(entry) {
@@ -194,6 +239,7 @@ KCM.SimpleKCM {
         var n = 2
         while (taken[unique]) unique = id + "_" + n++
         page.draft = page.draft.concat([{ id: unique, label: Accounts.defaultLabel(dir), path: dir }])
+        page._reprobe()
         return true
     }
 
@@ -202,6 +248,7 @@ KCM.SimpleKCM {
         var next = page.draft.slice()
         next.splice(index, 1)
         page.draft = next
+        page._reprobe()
     }
 
     function move(index, delta) {
@@ -211,6 +258,7 @@ KCM.SimpleKCM {
         var moved = next.splice(index, 1)[0]
         next.splice(to, 0, moved)
         page.draft = next
+        page._reprobe()
     }
 
     function labelOf(index) {
