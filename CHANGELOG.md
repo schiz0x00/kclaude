@@ -76,6 +76,24 @@ to load it, and once more per account building a scoped-limits cache that was
 then discarded because nothing had changed. A single `stat` now short-circuits
 the common case.
 
+**The selftest could not pass on Python 3.9.** One case parsed its own fixture
+with `datetime.fromisoformat("…Z")`, which only learned to read a trailing `Z`
+in 3.11 — so the leg of the matrix that exists to protect the oldest supported
+interpreter raised `ValueError` before reaching a single assertion. It is the
+same trap `parse_iso()` was written to avoid, reached from inside the test that
+guards it, and it went unnoticed because the selftest had only ever been run on
+newer interpreters. It now goes through `parse_iso()`.
+
+**The lint job was red on code nobody had touched.** `pip install ruff` with no
+version took whatever ruff was newest that day, and a bare `ruff check` took
+whatever that version's defaults were. A routine ruff release promoted
+`SIM`/`BLE`/`TRY` to defaults and the job failed on twenty-nine pre-existing
+findings, all of them in code the audit never edited. Ruff is now pinned, the
+rule set is named, and the one real finding among them — a dead assignment in a
+selftest case — is fixed. The wider rule set was tried and reported 98
+findings on this file; a lint job that fails on untouched code is worse than
+none, because it teaches people to ignore it.
+
 **The Accounts settings page could destroy your account list.** The page
 instantiated its `AccountList` with no `Component.onCompleted: refresh()`, so
 the read was never started, the working copy stayed empty, and pressing OK

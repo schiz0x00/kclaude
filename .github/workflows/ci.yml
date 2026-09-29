@@ -47,6 +47,23 @@ jobs:
   # A lint pass over the one Python file in the project. Ruff needs no config
   # and no dependencies in this repo, which is the point: the daemon is
   # stdlib-only and its test command has to stay that simple.
+  #
+  # Ruff is pinned and the rule set is named explicitly, because "pip install
+  # ruff" with no version takes whatever is newest that day and a bare
+  # `ruff check` takes whatever that version's defaults are. That is not
+  # hypothetical: the job was written that way, and had never run against a
+  # ruff new enough to promote SIM/BLE/TRY to defaults, so it sat green until
+  # a routine ruff release turned it red on twenty-odd pre-existing findings
+  # and would have stayed red. A lint job that fails on code nobody has
+  # touched is worse than no lint job, because it teaches people to ignore it.
+  #
+  # E4/E7/E9 is pyflakes' error set and F is its full set: real mistakes, and
+  # unused names. Nothing broader is in it on purpose. E731 would rewrite the
+  # selftest's lambda-assigned doubles into defs for no gain; SIM115 would
+  # rewrite twenty `json.load(open(...))` fixture reads into context managers;
+  # BLE001 would object to the `except Exception` blocks that are the
+  # deliberate containment keeping one account's failure from stopping the
+  # others. A wider set was tried and reported 98 findings on unchanged code.
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -56,10 +73,11 @@ jobs:
           python-version: "3.12"
       - name: Ruff
         run: |
-          pip install ruff
+          pip install "ruff==0.16.9"
           # The daemon has no .py extension, so it is linted through stdin with
           # an explicit filename rather than by path.
-          ruff check --stdin-filename daemon/kclaude-daemon.py - < daemon/kclaude-daemon
+          ruff check --no-cache --select E4,E7,E9,F \
+            --stdin-filename daemon/kclaude-daemon.py - < daemon/kclaude-daemon
 
   # Nothing enforces docs/i18n.md's extraction command, so a new user-facing
   # string written as a bare literal in one of the plasmashell-only files passes
