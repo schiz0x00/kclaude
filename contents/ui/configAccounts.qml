@@ -111,6 +111,10 @@ KCM.SimpleKCM {
         interval: 60
         repeat: false
         property int index: 0
+        // Sweep identity. Bumped by every start(); see _sweepIsCurrent.
+        property int generation: 0
+        // The generation the read currently in flight belongs to.
+        property int running: -1
         // Which account the read in flight belongs to. A slow read for one account
         // must not be filed under another's id.
         property string entryId: ""
@@ -119,10 +123,12 @@ KCM.SimpleKCM {
         onTriggered: {
             planProbe.index = 0
             planProbe.plan = ({})
+            planProbe.generation++
             planProbe.runNext()
         }
 
         function runNext() {
+            planProbe.running = planProbe.generation
             if (planProbe.index >= page.draft.length) {
                 page.planState = planProbe.plan
                 return
@@ -149,6 +155,12 @@ KCM.SimpleKCM {
             // no badge, with nothing anywhere saying why. OneShotReader's
             // watchdog guarantees this signal arrives either way, so the index
             // always advances and the sweep always terminates.
+            //
+            // ...unless the draft was edited while this read was in flight, in
+            // which case this result belongs to a sweep that has been
+            // superseded. Advancing anyway would file it under the new sweep's
+            // entryId and resume the count from the wrong position.
+            if (!page._sweepIsCurrent(planProbe)) return
             planProbe.plan[planProbe.entryId] = usageReader.isOffline
                 ? "" : usageReader.plan
             // The next one only after this read has landed, so the reads cannot
@@ -164,6 +176,32 @@ KCM.SimpleKCM {
     // under whichever account landed there next.
     function _reprobe() {
         planProbe.start()
+    }
+
+    // Plasma assigns the General page's cfg_* values around construction, and
+    // the probe reads usageBasePath once when the accounts land. A path that
+    // arrives after that first sweep is answered from the default directory, so
+    // every badge reads unknown until the dialog is reopened -- for a user who
+    // pointed the widget at their own collector, which is exactly the case the
+    // alias exists for. Re-run rather than trust the ordering.
+    onUsageBasePathChanged: if (page._loadCompleted) page._reprobe()
+
+    // How many badge sweeps have been started. Observable on purpose: the
+    // probe is a Timer, so it is not in the page's `children` (those are
+    // QQuickItems, and a Timer is not one), and a rule that only exists inside
+    // a component nobody can reach is a rule nothing can pin.
+    readonly property int probeSweeps: planProbe.generation
+
+    // Whether a sweep result still belongs to the sweep that is running.
+    //
+    // Every edit restarts the probe, and a restart resets index and entryId
+    // while a read from the previous sweep may still be in flight. That read's
+    // onUsageUpdated then arrives against the *new* sweep's row and would store
+    // one account's plan against another, resuming the count from the wrong
+    // position. A generation counter is the fix; a method so the rule is one
+    // line that a test can pin without reaching into the Timer.
+    function _sweepIsCurrent(probe) {
+        return probe.running === probe.generation
     }
 
     // --- writing ------------------------------------------------------------

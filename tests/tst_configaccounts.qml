@@ -201,6 +201,39 @@ TestCase {
                 "/tmp/mine/usage-claude_dad.json")
     }
 
+    // Plasma assigns the General page's cfg_* values around construction, and
+    // the badge sweep reads usageBasePath once, when the account list lands. A
+    // path assigned after that is never used: every badge is answered from the
+    // default directory and reads unknown until the dialog is reopened, which
+    // for a user with a collector of their own looks exactly like the accounts
+    // themselves are broken.
+    function test_12_a_usage_path_assigned_after_the_list_lands_is_re_probed() {
+        var page = pushPage()
+        // The list has landed, so a path arriving now has to trigger a sweep.
+        page._loadCompleted = true
+        page.draft = [{ id: "solo", label: "Solo", path: "/home/u/.claude" }]
+        compare(page.usageBasePath, "~/.local/state/kclaude/usage.json")
+
+        // probeSweeps counts the sweeps that have started, which is the
+        // observable effect of _reprobe(). The probe itself is a Timer, so it
+        // is not reachable through `children` and the page exposes the count.
+        var before = page.probeSweeps
+        page.cfg_filePath = "/tmp/mine/usage.json"
+        compare(page.usageBasePath, "/tmp/mine/usage.json")
+        wait(200)
+        compare(page.probeSweeps, before + 1,
+                "a path arriving after the list must start a new sweep")
+
+        // And before the list has landed there is nothing to sweep for, so
+        // assignment must not start one.
+        var other = pushPage()
+        other._loadCompleted = false
+        var before2 = other.probeSweeps
+        other.cfg_filePath = "/tmp/other/usage.json"
+        wait(200)
+        compare(other.probeSweeps, before2, "no sweep before the list has been read")
+    }
+
     // --- the real read and write path ---------------------------------------
     //
     // Every case above hand-assigns `draft`, which is why none of them noticed
@@ -210,7 +243,7 @@ TestCase {
     // user's real list. Both readers treat that as "no accounts" and fall back
     // to ~/.claude. The whole suite was green the entire time.
 
-    function test_12_the_page_reads_the_list_it_is_about_to_write() {
+    function test_13_the_page_reads_the_list_it_is_about_to_write() {
         var path = "/tmp/kclaude-tst-accounts-" + Math.floor(Date.now() / 1000) + ".json"
 
         // Write a real two-account list, through the page's own save().
@@ -238,7 +271,7 @@ TestCase {
         compare(page.draft[1].label, "Work")
     }
 
-    function test_13_a_list_that_was_never_read_is_not_written_back_as_empty() {
+    function test_14_a_list_that_was_never_read_is_not_written_back_as_empty() {
         var page = pushPage()
         page.accountsFilePath = "/tmp/kclaude-tst-never-read.json"
         page.draft = []
@@ -247,5 +280,32 @@ TestCase {
         wait(500)
         verify(page.saveError.length > 0,
                "a refused save must say so, not write an empty list quietly")
+    }
+
+    // A plan badge belongs to the account it was read for. The probe runs one
+    // read at a time and records which row the read in flight belongs to, and
+    // that is only sound if a superseded sweep cannot still deliver. The draft
+    // is edited -- a row moved, one added -- while a read is in flight, the
+    // probe restarts, and index and entryId are reset underneath the read that
+    // is still running. Its onUsageUpdated then files its result under the new
+    // sweep's row and resumes the count from the wrong position, so one account
+    // shows another's plan.
+    function test_15_a_superseded_probe_result_is_dropped() {
+        var page = pushPage()
+        // A stand-in for the probe, with the same two counters: the sweep that
+        // is in flight, and the sweep that is current. A read started by
+        // generation 1 landing after the draft was edited is the case.
+        var probe = { generation: 1, running: 1 }
+        compare(page._sweepIsCurrent(probe), true, "the sweep in flight is current")
+
+        // The edit restarts the probe, so the in-flight read is now stale.
+        probe.generation = 2
+        compare(page._sweepIsCurrent(probe), false,
+                "a result from a superseded sweep must be dropped")
+
+        // And the current sweep's own results are still accepted, or no badge
+        // would ever appear.
+        probe.running = 2
+        compare(page._sweepIsCurrent(probe), true)
     }
 }
