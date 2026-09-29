@@ -1634,6 +1634,15 @@ def selftest():
     # which they can diverge: Python's str.isalnum() is Unicode-aware and the JS
     # regex is not, so "café" became "café" here and "caf" there and the widget
     # watched a file the collector never wrote. Nothing was red.
+    #
+    # Skipped when absent rather than asserted, because the installed copy has
+    # no tests/ directory beside it: the package ships the daemon to
+    # /usr/bin/kclaude-daemon and nothing else, so the Packages workflow's
+    # "python3 /usr/bin/kclaude-daemon --selftest" after an install was reading
+    # /usr/bin/../tests/fixtures/slugs.json and failing on every run. What the
+    # table adds over the inline checks below is the *shared* pinning of two
+    # implementations, and that is only meaningful in a checkout where the
+    # other half is present to disagree with.
     slug_fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 os.pardir, "tests", "fixtures", "slugs.json")
     if os.path.exists(slug_fixture):
@@ -1652,7 +1661,9 @@ def selftest():
             # put a row on the panel the other half has dropped.
             assert account_id(value) == "", (value, account_id(value))
     else:
-        raise AssertionError(f"the shared id table is missing: {slug_fixture}")
+        print(f"kclaude-daemon: no shared id table at {slug_fixture}; "
+              "skipping the cross-implementation cases (installed copy?)",
+              file=sys.stderr)
 
     # The cap exists because an over-long id produced a filename past NAME_MAX,
     # after which every write for that account failed with ENAMETOOLONG and the

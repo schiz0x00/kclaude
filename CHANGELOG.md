@@ -94,6 +94,16 @@ selftest case — is fixed. The wider rule set was tried and reported 98
 findings on this file; a lint job that fails on untouched code is worse than
 none, because it teaches people to ignore it.
 
+**The installed collector's selftest could not run.** The shared id table
+pinned the collector's slug against the widget's, which is the only direction in
+which two implementations of one rule can be caught diverging — but it lives in
+`tests/fixtures/`, and the package ships the daemon to `/usr/bin` with no
+`tests/` beside it. So the packaging check that installs the `.deb` and runs
+`/usr/bin/kclaude-daemon --selftest` had been failing on every run, reading
+`/usr/bin/../tests/fixtures/slugs.json`. The table is skipped when it is not
+there, with a line in the journal saying so, and still enforced in a checkout
+where the other half of the rule is present to disagree with.
+
 **The Accounts settings page could destroy your account list.** The page
 instantiated its `AccountList` with no `Component.onCompleted: refresh()`, so
 the read was never started, the working copy stayed empty, and pressing OK
