@@ -38,17 +38,42 @@ Item {
     // The name currently connected, so the watchdog can force it loose.
     readonly property string sourceName: _sourceName
 
-    // When false, a zero exit is a success even with empty stdout -- which is
-    // what a command that writes a file and prints nothing looks like. When true
-    // (the default) empty output is a failure, because for a read that means the
-    // file was empty or missing and there is nothing to hand back.
-    property bool expectOutput: true
+    // The two callers that are genuinely reading a document say so explicitly,
+    // because for them an empty read really is a failure: the file is missing or
+    // empty and there is nothing to hand back. Everyone else takes the default.
+    // (contents/code/FileUsageProvider.qml and contents/code/AccountList.qml.)
+
+    // Whether empty stdout counts as a failure.
+    //
+    // FALSE by default, and that is the safe direction: a command's contract is
+    // its exit status, and plenty of perfectly good ones say nothing. `test -f`
+    // and `printf ... > file` both succeed silently, and treating that silence as
+    // failure is how the settings page came to tell users that a folder holding a
+    // .credentials.json did not have one. Only a caller that is genuinely reading
+    // a document needs the opposite, and says so.
+    property bool expectOutput: false
+
+    // A ceiling on what one read may hand back, in characters.
+    //
+    // A usage file is a few hundred bytes; this is four orders of magnitude of
+    // headroom. The point is not the number, it is having one: a read whose
+    // payload is unexpectedly enormous should be a named failure the popup can
+    // report, not a multi-second JSON.parse on the GUI thread that takes the
+    // whole panel with it if it does not finish.
+    property int maxOutputChars: 1048576
 
     signal completed(string stdout)
     // Carries a reason because the two failures are not the same thing to a
     // caller: a non-zero exit means the file was not there, and a timeout means
     // the engine lost the callback. Both leave the caller with nothing to show.
     signal failed(string reason)
+
+    // The command's stderr from the last run that reached onNewData, trimmed.
+    // Set on success and on failure alike, because a caller that wants to report
+    // "systemctl said no" needs what it said -- the failure reason alone is only
+    // "exited 1 with no output", which says nothing about which of the several
+    // things that can go wrong actually did.
+    property string lastStderr: ""
 
     property bool _reading: false
     property bool _readQueued: false
@@ -61,6 +86,7 @@ Item {
         onNewData: function(name, data) {
             var raw = data.stdout
             var code = data.exitCode !== undefined ? data.exitCode : data["exit code"]
+            root.lastStderr = String(data.stderr !== undefined ? (data.stderr || "") : "").trim()
             _exec.disconnectSource(name)
             // Cleared before anything is emitted, and the owed flag read out
             // first, so a handler that calls run() does not re-enter believing a
@@ -68,7 +94,17 @@ Item {
             root._reading = false
             var owed = root._readQueued
             root._readQueued = false
-            if (code === 0 && (root.expectOutput === false || (raw && raw.length > 0))) {
+            if (raw && raw.length > root.maxOutputChars) {
+                // Refused rather than truncated. Half a document is not a
+                // document, and the caller is far better served by a named
+                // failure than by a parse error it cannot explain. The payload
+                // is already in memory by this point, so this bounds what the
+                // widget then does with it, not what the engine buffered -- but
+                // it is the part that was missing, since the caps in
+                // FileUsageProvider are all applied after the whole document is
+                // already a string.
+                root.failed("output larger than " + root.maxOutputChars + " characters")
+            } else if (code === 0 && (root.expectOutput === false || (raw && raw.length > 0))) {
                 root.completed(raw || "")
             } else {
                 root.failed("exited " + code + (raw && raw.length > 0 ? "" : " with no output"))

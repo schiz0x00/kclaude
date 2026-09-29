@@ -142,8 +142,13 @@ TestCase {
     // says so. Without this the popup would draw a half-hour-old number with the
     // same confidence as a one-minute-old one.
     function test_11_slow_window_reports_its_lag() {
-        var fileAt = new Date(Date.now() - 60000).toISOString()
-        var stale = new Date(Date.now() - 40 * 60 * 1000).toISOString()
+        // One reading of the clock, not two. Sampling Date.now() separately for
+        // the file and for the window makes the expected gap depend on whether a
+        // millisecond happened to tick between the two calls, which fails about
+        // one run in ten for reasons that have nothing to do with the code.
+        var now = Date.now()
+        var fileAt = new Date(now - 60000).toISOString()
+        var stale = new Date(now - 40 * 60 * 1000).toISOString()
         provider._parseResponse(JSON.stringify({
             windows: {
                 five_hour: { utilization: 0.82 },
@@ -160,10 +165,12 @@ TestCase {
     }
 
     function test_12_small_lag_is_not_worth_a_label() {
-        // Two minutes apart is noise, not a stale reading.
+        // Two minutes apart is noise, not a stale reading. One clock reading
+        // again, for the same reason as test_11.
+        var now = Date.now()
         provider._parseResponse(JSON.stringify({
-            windows: { fable: { utilization: 0.22, updatedAt: new Date(Date.now() - 120000).toISOString() } },
-            updatedAt: new Date().toISOString()
+            windows: { fable: { utilization: 0.22, updatedAt: new Date(now - 120000).toISOString() } },
+            updatedAt: new Date(now).toISOString()
         }))
         compare(provider.lastUsage.windows[0].behind, 0)
     }
@@ -226,5 +233,107 @@ TestCase {
         }))
         compare(provider.isOffline, true)
         compare(provider.plan, "")
+    }
+
+    // The collector names the account inside the file as well as in the
+    // filename, because the filename follows the account's *position* in the
+    // list. Reorder the settings page and the name moves between accounts for a
+    // poll interval; without this check that interval is drawn as if it were
+    // real, which is one account's percentage appearing under another account's
+    // name in the panel, the tooltip and the popup, with nothing to say so.
+    function test_18_a_file_belonging_to_another_account_is_refused() {
+        provider.expectedAccount = "solo"
+        provider._parseResponse(JSON.stringify({
+            windows: { five_hour: { utilization: 0.5 } },
+            account: "work",
+            updatedAt: new Date().toISOString()
+        }))
+        compare(provider.isOffline, true, "another account's numbers must not be shown")
+        verify(provider.errorMessage.length > 0, "and it must say so")
+    }
+
+    function test_19_the_right_account_is_accepted() {
+        provider.expectedAccount = "solo"
+        provider._parseResponse(JSON.stringify({
+            windows: { five_hour: { utilization: 0.5 } },
+            account: "solo",
+            updatedAt: new Date().toISOString()
+        }))
+        compare(provider.isOffline, false)
+        compare(provider.lastUsage.windows.length, 1)
+    }
+
+    // Backward safe in both directions: a hand-written file, or one from a
+    // collector older than the key, simply omits it and is taken at its word.
+    function test_20_a_file_with_no_account_key_is_still_accepted() {
+        provider.expectedAccount = "solo"
+        provider._parseResponse(JSON.stringify({
+            windows: { five_hour: { utilization: 0.5 } },
+            updatedAt: new Date().toISOString()
+        }))
+        compare(provider.isOffline, false)
+        compare(provider.lastUsage.windows.length, 1)
+    }
+
+    // The id is compared at the *id* cap, not the 32-character display cap the
+    // window names use. Truncating an id to 32 made every id past that compare
+    // unequal to itself, so the account was refused for ever -- a bug this case
+    // exists to keep from coming back.
+    function test_20a_a_long_id_matches_itself() {
+        var longId = ""
+        for (var i = 0; i < 60; i++) longId += "a"
+        provider.expectedAccount = longId
+        provider._parseResponse(JSON.stringify({
+            windows: { five_hour: { utilization: 0.5 } },
+            account: longId,
+            updatedAt: new Date().toISOString()
+        }))
+        compare(provider.isOffline, false, "a 60-character id is within the cap and must match")
+        // One past the cap is refused as someone else's file rather than
+        // truncated into a match.
+        var tooLong = longId + "bbbb"
+        provider._parseResponse(JSON.stringify({
+            windows: { five_hour: { utilization: 0.5 } },
+            account: tooLong,
+            updatedAt: new Date().toISOString()
+        }))
+        compare(provider.isOffline, true, "an over-long id is not this account's")
+    }
+
+    // Clamped at both ends. UsageBar pins its own width at 1.0, so an
+    // over-range value used to draw a full bar beside a label reading "550%" --
+    // the two disagreeing on screen with nothing to say which is right.
+    function test_21_utilization_is_clamped_to_the_contract() {
+        provider._parseResponse(JSON.stringify({
+            windows: {
+                five_hour: { utilization: 5.5 },
+                seven_day: { utilization: -3 },
+                thirty_day: { utilization: 0.25 }
+            },
+            updatedAt: new Date().toISOString()
+        }))
+        compare(provider.isOffline, false)
+        var byId = {}
+        for (var i = 0; i < provider.lastUsage.windows.length; i++) {
+            byId[provider.lastUsage.windows[i].id] = provider.lastUsage.windows[i].utilization
+        }
+        compare(byId.five_hour, 1.0, "above the contract is pinned to 1.0")
+        compare(byId.seven_day, 0.0, "below the contract is pinned to 0.0")
+        compare(byId.thirty_day, 0.25, "an in-range value is untouched")
+    }
+
+    // NaN is not JSON. json.dumps in the collector would have written a bare
+    // NaN token had it not been stopped, and JSON.parse here rejects the whole
+    // document -- so a single bad header took the account offline rather than
+    // dropping the one field that was wrong. Pinned so the clamp stays total.
+    function test_22_a_non_finite_utilization_is_dropped_not_parsed() {
+        provider._parseResponse('{"windows": {"five_hour": {"utilization": NaN}},'
+                                + ' "updatedAt": "' + new Date().toISOString() + '"}')
+        compare(provider.isOffline, true, "a non-JSON document is rejected outright")
+        provider._parseResponse(JSON.stringify({
+            windows: { five_hour: { utilization: 0.5 } },
+            updatedAt: new Date().toISOString()
+        }))
+        compare(provider.isOffline, false, "and the provider recovers on the next good read")
     }
 }

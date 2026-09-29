@@ -7,9 +7,12 @@ import "../code/TimeUtils.js" as TimeUtils
 PlasmoidItem {
     id: root
 
-    // The accounts to watch. Read once at startup and again whenever the settings
-    // page rewrites the list, so adding an account does not need a plasmashell
-    // restart -- the collector picks the same file up on its own.
+    // The accounts to watch. Re-read at startup, whenever the popup opens, and
+    // on its own slow timer -- so adding an account in the settings page does
+    // not need a plasmashell restart. Not on the refresh tick: that one runs
+    // every 30-60s and exists to re-read usage files, and adding a `cat` per
+    // tick to pick up a list that changes a handful of times a year is not a
+    // trade worth making.
     CodeModule.AccountList {
         id: accountList
         Component.onCompleted: refresh()
@@ -17,6 +20,19 @@ PlasmoidItem {
             root.refreshAll()
             root._syncModels()
         }
+    }
+
+    // The panel's own re-read cadence. Deliberately much slower than the usage
+    // refresh: the list changes when someone edits the settings page, which is
+    // an event, and the popup-open read below covers the common case anyway.
+    Timer {
+        id: accountListTimer
+        // 5 minutes, outside the user's configured usage-refresh interval.
+        interval: 5 * 60 * 1000
+        repeat: true
+        running: true
+        triggeredOnStart: false
+        onTriggered: accountList.refresh()
     }
 
     // One model per account, owned by a Repeater so adding or removing an account
@@ -54,6 +70,9 @@ PlasmoidItem {
                                                modelData.id, index)
             warningThreshold: Plasmoid.configuration.warningThreshold / 100
             criticalThreshold: Plasmoid.configuration.criticalThreshold / 100
+            // So the per-model "updated 3 minutes ago" timer runs only while
+            // the popup is actually on screen.
+            popupOpen: root.expanded
 
             Component.onCompleted: {
                 refresh()
@@ -74,16 +93,26 @@ PlasmoidItem {
     // popup's summary line report. An account with no numbers contributes
     // "unknown" rather than nothing, so a second account that has not polled yet
     // cannot make a full one look healthy.
+    //
+    // "offline" ranks above "sleeping", which ranks above "active", both below
+    // "warning". Seeding the roll-up with "unknown" and comparing strictly --
+    // which is what this did -- gave offline and unknown the same rank, which
+    // made "offline" unreachable: with every account unreadable the panel said
+    // "Unknown" while the same popup's per-account row, in the same window, said
+    // "Collector Offline". Every rank is distinct, so the answer does not depend
+    // on which account happens to be first in the list.
     readonly property string worstStatus: {
-        var order = { "limit_reached": 4, "critical": 3, "warning": 2, "active": 1,
-                      "offline": 0, "unknown": 0 }
-        var worst = "unknown"
+        var order = { "limit_reached": 6, "critical": 5, "warning": 4, "offline": 3,
+                      "sleeping": 2, "active": 1, "unknown": 0 }
+        var worst = ""
         for (var i = 0; i < root.accountModels.length; i++) {
             var s = root.accountModels[i].status
             if (!Object.prototype.hasOwnProperty.call(order, s)) continue
-            if (order[s] > order[worst]) worst = s
+            if (worst === "" || order[s] > order[worst]) worst = s
         }
-        return worst
+        // Nothing has reported at all, which is genuinely "unknown": there is
+        // nothing failing, there is only nothing there yet.
+        return worst === "" ? "unknown" : worst
     }
 
     CodeModule.ServiceControl {
@@ -160,6 +189,8 @@ PlasmoidItem {
         usageModels: root.accountModels
         aggregateStatus: root.worstStatus
         collector: collectorService
+        // So the popup's 1 s countdown clock is gated on being open.
+        plasmoidItem: root
     }
 
     toolTipMainText: Plasmoid.configuration.showTooltip ? "kclaude" : ""
@@ -186,7 +217,9 @@ PlasmoidItem {
             if (wins.length === 0) {
                 lines.push("  " + (model.dataError.length > 0
                                    ? model.dataError
-                                   : i18n("Waiting for usage data")))
+                                   : (model.readError.length > 0
+                                      ? model.readError
+                                      : i18n("Waiting for usage data"))))
                 continue
             }
             for (var i = 0; i < wins.length; i++) {
@@ -199,6 +232,8 @@ PlasmoidItem {
             }
             if (model.dataError.length > 0) {
                 lines.push("  " + model.dataError)
+            } else if (model.readError.length > 0) {
+                lines.push("  " + model.readError)
             }
         }
         lines.push(i18n("Status: %1", TimeUtils.getStatusLabel(root.worstStatus)))
@@ -221,6 +256,10 @@ PlasmoidItem {
         if (!root.expanded) {
             return
         }
+        // Pick up an account added in the settings since the last read. This is
+        // a single `cat`, on an action the user just took, and it is what makes
+        // "no plasmashell restart needed" true rather than merely intended.
+        accountList.refresh()
         if (Plasmoid.configuration.refreshOnPopup) {
             root.refreshAll()
         }

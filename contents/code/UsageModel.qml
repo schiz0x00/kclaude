@@ -15,6 +15,15 @@ Item {
     // Empty when everything is fine.
     readonly property string dataError: _provider.fileError
 
+    // Why *this widget* could not read the file, as distinct from the collector
+    // reporting a problem. FileUsageProvider classifies seven different faults
+    // here -- no path, unreadable, timed out, bad JSON, missing windows, empty,
+    // wrong account -- and every one of them used to stop at
+    // FileUsageProvider.errorMessage, which nothing read. So a mistyped path in
+    // the settings and a collector that has not written yet were the same grey
+    // dot with no explanation anywhere.
+    readonly property string readError: _provider.errorMessage
+
     // Which account these numbers belong to. Not read from the usage file: the
     // collector writes one file per account and the widget is the thing that
     // knows which is which, so the label travels alongside the read rather than
@@ -34,9 +43,18 @@ Item {
     property var _lastGoodState: null
     property bool _hasGoodState: false
 
+    // Whether the popup is on screen. Set by main.qml from the applet item's
+    // `expanded`; the model has no way to know on its own, and the timer below
+    // has no reason to run when nothing shows what it feeds.
+    property bool popupOpen: false
+
     FileUsageProvider {
         id: _provider
         filePath: root.filePath
+        // So a file that is briefly somebody else's -- which a reorder in the
+        // settings page can make it, since the filename follows the account's
+        // position -- is refused rather than drawn under this account's name.
+        expectedAccount: root.accountId
     }
 
     Connections {
@@ -49,7 +67,10 @@ Item {
     Timer {
         id: _relativeTimer
         interval: 10000
-        running: true
+        // Only while the popup is open, because that is the only thing this
+        // updates. One of these per account, forever, for a string no closed
+        // popup shows, is a cost with no reader at all.
+        running: root.popupOpen
         repeat: true
         onTriggered: root._updateRelativeTime()
     }
@@ -70,9 +91,14 @@ Item {
                     lastUpdated: _provider.lastUsage.lastUpdated
                 }
             }
-            // Readable but stale means the collector stopped updating: show the
-            // numbers, but flag them as not live.
-            root._applyUsage(_provider.lastUsage, _provider.isStale)
+            // Readable, stale or not. Staleness is reported through readError
+            // ("Usage data is stale") and through the "N minutes ago" line; it
+            // must not decide the severity. Passing isStale here -- which this
+            // used to do -- routed a stale file into the unreadable branch, so
+            // a file the collector had simply stopped updating was reported as
+            // "sleeping"/"offline" and getStatus() was never called: a stale
+            // 99% drew a blue bar and read "Waiting for a limit to reset".
+            root._applyUsage(_provider.lastUsage, false)
         } else if (_provider.isOffline && root._hasGoodState) {
             // A file that cannot be read at all also cannot clear a plan: the
             // collector is the only writer of that field, so an account whose
@@ -88,7 +114,11 @@ Item {
         }
     }
 
-    function _applyUsage(data, isOffline) {
+    // `unreadable` is not `stale`. A file the collector stopped updating is
+    // still readable, and its numbers are still the best answer there is --
+    // but they are not live, and it says so through readError. `unreadable` is
+    // the one case where there is no fresh answer to grade at all.
+    function _applyUsage(data, unreadable) {
         root.provider = data.provider || "claude"
         root.windows = data.windows || []
         if (data.lastUpdated) {
@@ -107,14 +137,33 @@ Item {
         }
         root.limitingWindow = limitingId
 
-        if (isOffline) {
-            root.status = "offline"
+        if (unreadable) {
+            root.status = _quietUntilReset() ? "sleeping" : "offline"
         } else if (maxUtil >= 0) {
             root.status = TimeUtils.getStatus(maxUtil, root.warningThreshold, root.criticalThreshold)
         } else {
             root.status = "unknown"
         }
 
+    }
+
+    // Whether the collector is plausibly waiting for a window to turn over
+    // rather than having died.
+    //
+    // Two decisions that are each correct on their own and contradict each
+    // other: the collector deliberately stops polling an account whose window is
+    // spent, and the widget calls anything older than fifteen minutes "offline".
+    // So a collector doing exactly what it was built to do produced the one
+    // signal that means "the collector crashed", and the grey dot was the only
+    // feedback a user got. The reset time is already in the file, so the two
+    // cases can be told apart; before this they could not.
+    function _quietUntilReset() {
+        var wins = root.windows
+        for (var i = 0; i < wins.length; i++) {
+            var ms = new Date(wins[i].resetAt || "").getTime()
+            if (!isNaN(ms) && ms > Date.now()) return true
+        }
+        return false
     }
 
     function _updateRelativeTime() {

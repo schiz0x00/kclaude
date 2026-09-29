@@ -18,6 +18,16 @@ Item {
 
     property var collector: null
 
+    // The applet item, so the clock below can be gated on the popup actually
+    // being open. Plasma instantiates a full representation at applet load, not
+    // on first open, so without this the 1 s timer has been running inside
+    // plasmashell for the whole session -- 86,400 ticks a day, each one
+    // re-evaluating every "Resets in ..." and every "as of ..." in the popup for
+    // a window nobody is looking at.
+    property var plasmoidItem: null
+
+    readonly property bool _popupOpen: plasmoidItem ? plasmoidItem.expanded === true : false
+
     // The worst status across accounts, from main.qml.
     property string aggregateStatus: "unknown"
 
@@ -40,7 +50,7 @@ Item {
 
     Timer {
         interval: 1000
-        running: true
+        running: root._popupOpen
         repeat: true
         triggeredOnStart: true
         onTriggered: root.nowTick++
@@ -277,8 +287,30 @@ Item {
                         Layout.fillWidth: true
                     }
 
+                    // Why this widget could not read the file, when it could not.
+                    // Deliberately dimmer than the red banner above: that one
+                    // means "only you can fix this", and a misconfigured path or
+                    // a file the collector has not written yet is information,
+                    // not an instruction.
                     PlasmaComponents3.Label {
-                        visible: !accountDelegate._hasWindows && accountDelegate.modelData.dataError.length === 0
+                        visible: accountDelegate.modelData.readError.length > 0
+                        text: accountDelegate.modelData.readError
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WordWrap
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.6
+                        Layout.fillWidth: true
+                    }
+
+                    PlasmaComponents3.Label {
+                        // Hidden while the popup's own empty state is up: with
+                        // nothing at all to show, that state already says why,
+                        // and two paragraphs explaining the same thing is one
+                        // too many.
+                        visible: !accountDelegate._hasWindows
+                                 && accountDelegate.modelData.dataError.length === 0
+                                 && accountDelegate.modelData.readError.length === 0
+                                 && root._anyWindows
                         text: i18n("Waiting for usage data...") // qmllint disable unqualified
                         textFormat: Text.PlainText
                         font: Kirigami.Theme.smallFont
@@ -335,7 +367,13 @@ Item {
                                 textFormat: Text.PlainText
                                 font: Kirigami.Theme.smallFont
                                 opacity: 0.6
-                                visible: !!windowDelegate.modelData.resetAt
+                                // Gated on the setting, which is what its label
+                                // promises. It used to gate only the summary
+                                // line at the bottom of the popup, leaving all
+                                // three per-window countdowns showing whatever
+                                // the user had just switched off.
+                                visible: !!Plasmoid.configuration.showResetCountdown
+                                         && !!windowDelegate.modelData.resetAt
                             }
 
                             // A window the collector refreshes on a rarer cadence than
@@ -368,7 +406,13 @@ Item {
             }
 
             PlasmaComponents3.Label {
-                visible: !!Plasmoid.configuration.showResetCountdown && !!root._limitingWindowData
+                // The resetAt test is not redundant: a window can be present
+                // with no reset time at all, and formatResetTime("") answers
+                // "Now" -- so this used to promise a reset that had already
+                // happened, in the one line a user is most likely to act on.
+                visible: !!Plasmoid.configuration.showResetCountdown
+                         && !!root._limitingWindowData
+                         && !!root._limitingWindowData.resetAt
                 text: {
                     // Same clock dependency as the per-window countdown above.
                     var tick = root._now
@@ -382,6 +426,27 @@ Item {
                 Layout.leftMargin: Kirigami.Units.largeSpacing
                 Layout.rightMargin: Kirigami.Units.largeSpacing
                 Layout.topMargin: Kirigami.Units.smallSpacing
+            }
+
+            // Whatever systemctl last had to say. ServiceControl has always
+            // recorded this and nothing has ever read it, so a start that
+            // failed with a real message ("Failed to start ...: Unit not found",
+            // a refused polkit action, a bad unit file) looked exactly like one
+            // that had not been attempted yet. Capped and plain-text: it is a
+            // command's stderr, and the rest of this file treats anything it
+            // renders as untrusted.
+            PlasmaComponents3.Label {
+                readonly property string _err: root.collector
+                    ? String(root.collector.lastError || "").substring(0, 200) : ""
+                visible: text.length > 0
+                text: _err
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                font: Kirigami.Theme.smallFont
+                opacity: 0.6
+                Layout.fillWidth: true
+                Layout.leftMargin: Kirigami.Units.largeSpacing
+                Layout.rightMargin: Kirigami.Units.largeSpacing
             }
 
             Kirigami.Separator {

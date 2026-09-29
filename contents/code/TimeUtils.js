@@ -60,6 +60,10 @@ function getStatusLabel(status) {
         case "warning": return _tr("High Usage")
         case "critical": return _tr("Near Limit")
         case "limit_reached": return _tr("Limit Reached")
+        // Not "Collector Offline". The collector stops polling an account whose
+        // window is spent -- up to five hours, longer for a weekly one -- and
+        // calling that an outage reports the one thing it is designed to avoid.
+        case "sleeping": return _tr("Waiting for a limit to reset")
         case "unknown": return _tr("Unknown")
         case "offline": return _tr("Collector Offline")
         default: return _tr("Unknown")

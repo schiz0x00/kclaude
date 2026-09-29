@@ -71,14 +71,22 @@ exactly as they always did.
 - `plan` is optional and is the subscription type out of the credentials
   (`max`, `pro`, …). The daemon writes it because it is the only thing that
   reads the credentials, and the widget is not allowed to. The widget
-  allow-lists four values and shows no badge for anything else, so this string —
-  the one field in the file that was never written by code in this repository —
-  cannot become arbitrary text on the panel.
+  allow-lists four values and shows no badge for anything else, so a string the
+  collector chose cannot become arbitrary text on the panel.
+- `account` is optional and is the id of the account the numbers belong to. The
+  *filename* carries an id too, but it is derived from the account's **position**
+  in the list, so reordering the settings page moves a name between accounts for
+  one poll interval. This key does not move: the widget compares the two and
+  refuses a file that claims to be another account's, rather than drawing it.
+  A file with no `account` key — hand-written, or from a collector predating it
+  — is taken at its word, so the change is backward safe in both directions.
 - Unknown window keys are accepted and title-cased for display
   (`core_seven_day` → "Core Seven Day"); entries without a numeric
   `utilization` are skipped, never shown as 0%. At most 8 windows, names
-  capped at 32 chars: the path to the file is user-configurable, so its
-  contents are treated as untrusted.
+  capped at 32 chars, `utilization` clamped to 0.0–1.0, and one read capped at
+  1 MiB by `OneShotReader`: the path to the file is user-configurable, so its
+  contents are treated as untrusted. The read cap is the one that has to come
+  first — every other cap is applied to a document that is already in memory.
 
 With more than one account there is one such file per account: the first entry
 keeps `usage.json` verbatim, the rest are `usage-<id>.json` beside it. Separate
@@ -134,8 +142,26 @@ rejected because the accounts' five-hour windows genuinely reset hours apart
 heading read as a single account with six limits.
 
 Status is derived from the *most utilized* window: `active` → `warning`
-(default 75%) → `critical` (90%) → `limit_reached` (100%), with `offline`
-when the data is stale or unreadable and `unknown` before first data.
+(default 75%) → `critical` (90%) → `limit_reached` (100%), with `unknown` before
+first data.
+
+Stale or unreadable splits in two, which it did not used to, because two
+decisions that are each correct on their own used to contradict each other: the
+collector deliberately stops polling an account whose window is spent — up to
+five hours, longer for a weekly one — and the widget calls anything older than
+fifteen minutes an outage. So a collector doing exactly what it was built to do
+produced the one signal that means "the collector crashed", and a grey dot was
+the only feedback a user got. `sleeping` is that case (a window whose `resetAt`
+is still in the future, so the collector is waiting for a limit to turn over)
+and `offline` is everything else. The reset time is already in the file, so the
+two can be told apart.
+
+Across accounts, `worstStatus` ranks `limit_reached` > `critical` > `warning` >
+`offline` > `sleeping` > `active` > `unknown`, and every rank is distinct so the
+answer does not depend on which account happens to be first. It used to seed the
+roll-up with `unknown` and compare strictly, which gave `offline` and `unknown`
+the same rank and made `offline` unreachable — the panel said "Unknown" while
+the same popup's per-account row, in the same window, said "Collector Offline".
 
 ## Decisions worth knowing about
 
@@ -153,10 +179,21 @@ strings.
 ("dataengine support has been removed from KF6; this provides a temporary
 implementation during the transition"). It ships with every current Plasma 6
 release, but may disappear in Plasma 7. The dependency is deliberately
-confined to two files — `FileUsageProvider.qml` and `ServiceControl.qml` —
+confined to three files — `FileUsageProvider.qml`, `AccountList.qml` and
+`ServiceControl.qml`, all of which reach it only through `OneShotReader.qml` —
 so the exit is contained: if KDE ships a QML file-reading or process API (or
-plasma5support is dropped), those two files are the entire migration surface.
-Nothing else in the widget knows how the data arrives.
+plasma5support is dropped), those three plus `OneShotReader` are the entire
+migration surface. Nothing else in the widget knows how the data arrives.
+
+Every one of those commands is `cat -- <quoted path>`, not `cat <quoted path>`.
+Quoting makes a path inert to the *shell*; it does nothing about the program,
+which still parses its arguments. The usage-file path is a free-text field the
+user typed, so a value like `-n` is a legitimate thing for it to hold, and
+without `--` cat reads it as an option — silently producing nothing for `-n`,
+or answering `--help` with its own help text and exit 0, which the provider then
+tries to `JSON.parse`. `tests/shell-quote.test.js` round-trips both forms
+through a real bash. (A file named exactly `-` is not covered: cat special-cases
+that one to mean stdin even after `--`. `./-` or an absolute path does.)
 
 ### Why refreshes are coalesced, and why a stuck read is recovered
 
@@ -185,18 +222,33 @@ it is the only thing that can undo a source the engine still believes is
 running, so it force-disconnects the name and reports a timeout rather than
 leaving the widget quietly frozen.
 
-`ServiceControl` does the same three-process dance and gets the same
-per-instance source registry, so its `show`/`start`/`kill` strings cannot
-collide with the `cat` above — different `DataSource` objects, and the registry
-is per-instance (also measured).
+`ServiceControl` used to do the same four-process dance with three raw
+`DataSource` objects of its own, and therefore had *none* of this: no
+coalescing, no in-flight guard, no watchdog. One lost `onNewData` left each of
+its three source names held for the rest of the session, so `serviceState`
+froze at whatever it last was, and `requestPoll`/`requestPrime` went on
+returning true as though the signal had been delivered — permanently disarming
+the session primer, with nothing said anywhere. It now goes through
+`OneShotReader` like everything else, with the refresh poke and the prime on
+*separate* readers so that coalescing can never deliver one in place of the
+other.
 
-All of this now lives in `OneShotReader.qml`, shared. It started as the body of
+All of this lives in `OneShotReader.qml`, shared. It started as the body of
 `FileUsageProvider` and was pulled out when `AccountList` needed the same
 guarantees: a second copy of the wedge recovery is a second place for it to be
 un-fixed, and the failure mode is a widget frozen on stale data with nothing
-indicating why. `expectOutput` is the one knob that differs between the two
-callers — a `cat` with no output is a failure, a `printf > file` with no output
-is a success.
+indicating why. There are now five callers, and `expectOutput` is the one knob
+that differs between them.
+
+`expectOutput` **defaults to false**, which is the safe direction: a command's
+contract is its exit status, and plenty of perfectly good ones say nothing.
+This was the reverse, and it broke the settings page in a way that was
+invisible to every test in the repository: `test -f` (the "does this folder hold
+a Claude config" check behind *Add folder…*) and `printf … > file` both succeed
+silently, and treating that silence as failure meant a valid folder was reported
+as "has no .credentials.json" and `onCompleted` — the only thing that calls
+`addAccount()` — never ran. Only the two `cat` callers genuinely read a
+document, and they say so explicitly.
 
 ### Why every interpolated shell string goes through Shell.js
 
@@ -261,22 +313,57 @@ So it is `~/.config/kclaude/accounts.json`, written by the settings page's
 `save()` and read by the daemon. Neither side owns it: the widget parses it for
 what to draw, the daemon parses it for what to poll, and they agree on the
 `id`/`label`/`path` shape and on the slug rule that turns an id into a filename.
-Both ends of that agreement are pinned —
-`account_id()` in the daemon's `--selftest`, `Accounts.slug` in
-`tests/accounts.test.js` — because the failure is silent: if the two disagree on
-one character, the widget watches a file the collector never writes and that
-account shows nothing forever.
+The failure is silent: if the two disagree on one character, the widget watches
+a file the collector never writes and that account shows nothing forever.
+
+So the rule lives in **one table, `tests/fixtures/slugs.json`**, read by
+`account_id()` in the daemon's `--selftest` *and* by `Accounts.slug` in
+`tests/accounts.test.js`. Each side used to be pinned against itself, which is
+precisely the one direction in which two implementations cannot be caught
+diverging — and they had diverged: Python's `str.isalnum()` is Unicode-aware
+and the JavaScript regex is not, so `café` became `café` on the collector's side
+and `caf` on the widget's. Both suites were green throughout. The rule is now
+ASCII-only on both sides, and non-string ids are dropped rather than coerced, so
+a number cannot become an id on one side and nothing on the other.
+
+The table also pins the **64-character cap**, which is a filename limit rather
+than a taste: an id long enough to overflow `NAME_MAX` made every write to that
+account's usage file fail with `ENAMETOOLONG`, which the poll's backoff turned
+into "this account silently shows nothing for ever" with one line in the
+journal. Neither side capped it before.
+
+`MAX_ACCOUNTS` is applied to how many accounts are *kept*, on both sides.
+Slicing the input list meant a file whose first eight entries were all
+unusable fell through to the default account even when entry nine was fine —
+while the widget, which caps its own output, disagreed about which rows exist.
 
 `SimpleKCM` persists the `cfg_*` properties itself; a page that writes its own
 file has to reimplement `save()`, or Apply does nothing and says so nowhere.
 `tests/package-layout.test.js` checks that a page which calls `Shell.writeFile`
 also defines `save()`.
 
+That `save()` is also **gated on a read having completed**. An empty list is a
+legitimate answer — a file that really does list nothing, or one the user
+emptied on purpose — but so is "the read never finished", and the two are
+indistinguishable from `draft` alone. The page used to have no
+`Component.onCompleted: refresh()` on its `AccountList`, so the read was simply
+never started: the draft stayed empty, every plan badge was blank, and pressing
+OK wrote `{"accounts": []}` over the user's real list, which both readers treat
+as "no accounts" and answer by falling back to `~/.claude`. The test suite
+could not see it, because every case in `tst_configaccounts.qml` hand-assigned
+`page.draft`.
+`tests/tst_configaccounts.qml` now writes a real two-account file through the
+page's own `save()` and reads it back through a page constructed with
+`accountsFilePath` as an initial property — the constructor path, which is the
+one that was broken.
+
 A missing file is not an error. It is what every install predating this feature
 looks like, so it resolves to the single `~/.claude` account and nothing has to
 be configured to keep working. An unusable *entry* is dropped with a reason in
 the journal, because one bad path must not cost the user the accounts that are
-fine.
+fine. A file that is **present but unreadable** is a third thing again, and the
+collector fails *closed* on it: it keeps the account list already running rather
+than repointing every account — and every token refresh — at `~/.claude`.
 
 ### Why an entry with no usable path is dropped, never defaulted
 
@@ -322,8 +409,9 @@ independent — separate tokens, separate rate-limit budgets, separate resets.
 
 `wake_floor` stays per account for the reason it existed at all: a Refresh click
 may bring an account forward to `last_poll + wake_floor` but no further, so a
-signal cannot short-circuit a 429 or a spent limit. During an error backoff that
-floor *is* the backoff, which is what stops one 429 becoming a hammer.
+signal cannot short-circuit a spent limit or an error backoff. During a backoff
+that floor *is* the backoff, which is what stops a held-down button turning one
+failure into a hammer.
 
 One consequence worth stating: adding an account is noticed on the next loop
 iteration, which is the poll cadence. So a new account starts polling within
@@ -378,14 +466,69 @@ the user to re-authenticate Claude Code itself. The `flock` on
 `daemon.lock` makes the second instance exit 0 (systemd sees success, no
 restart loop).
 
+A lock file that cannot be *used* is the same kind of permanent condition and
+gets the same treatment: an unwritable state directory exits 0 with a one-line
+explanation rather than raising, because `Restart=on-failure` with
+`RestartSec=30` would otherwise turn it into a loop that never once polls
+anything.
+
+### Why one bad account cannot stop the others
+
+`poll_account` promises "never raises", and the loop relies on that: a panel
+that silently freezes a working account because a second one needs
+re-authenticating is worse than one row saying what is wrong.
+
+That promise was broken by the one place the function did I/O of its own. The
+`AuthError` handler called `write_error` with nothing around it, so an unwritable
+state directory plus one expired login escaped the handler, out of `poll_account`,
+past the unguarded call in the loop, and killed the process — taking every other
+account with it. The schedule is now set *before* the diagnostic is written, the
+write is guarded, and the loop wraps the call as well, so no future edit inside
+`poll_account` can take the process down. Pinned by `--selftest` with the state
+directory pointed at a path that cannot be one.
+
 ### The credential file is shared, not owned
 
 The daemon reads `~/.claude/.credentials.json` (Claude Code's file), and when
 it refreshes the token it re-reads the file immediately before writing back
-*only* the `claudeAiOauth` key, atomically, mode 0600. Claude Code does not
-take the daemon's lock, so a lost-update window of microseconds remains; the
-merge discipline keeps Claude Code's other keys (`mcpOAuth`, etc.) intact
-either way. Pinned by `--selftest`.
+*only the three keys the refresh actually changed* — `accessToken`,
+`refreshToken`, `expiresAt` — atomically, mode 0600. Everything else, including
+`scopes`, `subscriptionType` and `rateLimitTier` *inside* `claudeAiOauth`, is
+Claude Code's. Claude Code does not take the daemon's lock, so a lost-update
+window of microseconds remains.
+
+Three things make the "intact either way" promise actually true, and all three
+used to be false:
+
+- **An unreadable file is not an empty one.** The merge used to answer a failed
+  re-read with `{}` and rewrite the whole file, which is how a transient parse
+  error — Claude Code caught mid-write, a truncated file — turned into a
+  permanently deleted `mcpOAuth`. Only a genuinely *absent* file is created now;
+  anything else propagates, leaves the file exactly as it was, and is retried on
+  the next poll.
+- **A reply is validated before `oauth` is touched.** A 200 whose body is not a
+  token reply has not rotated anything, so it is an ordinary retryable protocol
+  error — but it must be raised before any mutation, or a half-applied reply is
+  what lands on disk. A missing `expires_in` now means "expiry unknown" rather
+  than "expiry unchanged", which otherwise made every poll a token request.
+- **The write is a compare-and-swap.** If the file no longer holds the refresh
+  token that was sent, Claude Code re-authenticated while this refresh was in
+  flight, and the reply is discarded rather than written over a new login.
+
+A failed *write* after a successful rotation is its own case, and the nastiest
+one: the server has already invalidated the old refresh token, so the copy on
+disk is dead and re-posting it would come back `invalid_grant` and cost the user
+their login. The fresh token is therefore held on the `Account` and persisted by
+a later poll rather than spent on a second rotation.
+
+Pinned by `--selftest`, including the damaged-file and compare-and-swap cases
+that were the ones actually able to lose data.
+
+`write_atomic` also fsyncs the *directory* after the rename. `os.replace` only
+guarantees the rename reaches the disk once the parent has been synced; without
+it a crash can revert the file. For `usage.json` that costs a poll interval. For
+`.credentials.json` it costs the login, because the file reverted to holds a
+refresh token the server has already invalidated.
 
 ### The re-authentication surface
 
@@ -550,10 +693,34 @@ account.
 With N accounts these layers apply N times over, and so does the cost: each
 account is pinged every 60s against its own budget, and the scarce usage
 endpoint has a budget per account too — so two accounts cost roughly twice one,
-and `MAX_ACCOUNTS` (8) exists so that cannot happen by accident. The first ping after the reset is
-what opens the new five-hour window. Every window is checked, not just the
-five-hour one, since a spent weekly budget refuses the same request for days;
-no wait outlives one window's length.
+and `MAX_ACCOUNTS` (8) exists so that cannot happen by accident. It is applied
+to how many accounts are *kept*, not to how many entries are read, so a file
+whose first eight entries are all unusable does not cost the user the ninth.
+The first ping after the reset is what opens the new five-hour window. Every
+window is checked, not just the five-hour one, since a spent weekly budget
+refuses the same request for days; no wait outlives one window's length.
+
+Two things bound this from below as well as above, and both used to be missing:
+
+- **A spent window whose reset has already passed waits `MIN_POLL_GAP`, not
+  `RESET_SLACK`.** A clock skew, a stale header, or a `resets_at` without an
+  offset read on a machine east of UTC all produce a reset in the past, and the
+  arithmetic clamped that to exactly 10 seconds — below the daemon's own 30s
+  floor and six times below its 60s cadence. That is the one behaviour this file
+  exists to avoid, reachable by nothing more than a wrong timestamp.
+- **A non-finite utilization is never "spent".** `utilization < 100.0` is false
+  for NaN, so a NaN window read as exhausted and put the account to sleep for
+  the whole window, with a `wake_floor` no manual Refresh could pull it out of.
+  The same value would have been written into `usage.json` as a bare `NaN`
+  token, which is not JSON — ECMA-262 has no NaN literal — so the widget's
+  `JSON.parse` rejects the document and the account goes to "Collector Offline".
+  It is refused at the header, at the endpoint, at normalization, and again by
+  `json.dumps(..., allow_nan=False)`.
+
+Jitter is a per-account offset folded into that account's own schedule, not
+added to the loop's shared sleep. Adding it to the sleep stretched every
+effective interval to 60–75s and quietly contradicted the 60s cadence that the
+README, the settings page and the CHANGELOG all state.
 
 ### systemd unit choices
 
@@ -571,3 +738,24 @@ Both endpoints the daemon uses (`api.anthropic.com/api/oauth/usage`,
 the daemon reuses Claude Code's OAuth client id. They can change or disappear
 without notice; treat the collector as best-effort. The widget half keeps
 working with any other writer of the file contract.
+
+Redirects are refused outright, on all four requests. CPython's default
+`HTTPRedirectHandler.redirect_request` copies every header across a redirect
+except content-length and content-type, so a 302 would carry
+`Authorization: Bearer sk-ant-oat01-…` to whatever host sent it. None of these
+endpoints redirect in normal operation, so refusing costs nothing.
+
+## Interpreter requirement
+
+Python 3.9 or newer, and CI runs the selftest on 3.9, 3.11 and 3.14 to keep it
+that way.
+
+The floor used to be higher than it looked. `iso()` writes a trailing `Z` and
+`datetime.fromisoformat` only learned to read one in **3.11**; on anything
+older every reset time failed to parse, the `ValueError` was swallowed into a
+one-hour fallback, and the entire "go quiet until the window resets" design
+silently degraded to a flat backoff. The daemon declares only "python3" in
+`packaging/nfpm.yaml` and nowhere states a version, so this was an undeclared
+requirement discovered by running the code rather than by reading it. `parse_iso()`
+now normalises the `Z` itself, and the matrix job is what keeps a future 3.11-ism
+from being reintroduced quietly.
