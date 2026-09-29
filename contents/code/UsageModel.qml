@@ -91,9 +91,14 @@ Item {
                     lastUpdated: _provider.lastUsage.lastUpdated
                 }
             }
-            // Readable but stale means the collector stopped updating: show the
-            // numbers, but flag them as not live.
-            root._applyUsage(_provider.lastUsage, _provider.isStale)
+            // Readable, stale or not. Staleness is reported through readError
+            // ("Usage data is stale") and through the "N minutes ago" line; it
+            // must not decide the severity. Passing isStale here -- which this
+            // used to do -- routed a stale file into the unreadable branch, so
+            // a file the collector had simply stopped updating was reported as
+            // "sleeping"/"offline" and getStatus() was never called: a stale
+            // 99% drew a blue bar and read "Waiting for a limit to reset".
+            root._applyUsage(_provider.lastUsage, false)
         } else if (_provider.isOffline && root._hasGoodState) {
             // A file that cannot be read at all also cannot clear a plan: the
             // collector is the only writer of that field, so an account whose
@@ -109,7 +114,11 @@ Item {
         }
     }
 
-    function _applyUsage(data, isOffline) {
+    // `unreadable` is not `stale`. A file the collector stopped updating is
+    // still readable, and its numbers are still the best answer there is --
+    // but they are not live, and it says so through readError. `unreadable` is
+    // the one case where there is no fresh answer to grade at all.
+    function _applyUsage(data, unreadable) {
         root.provider = data.provider || "claude"
         root.windows = data.windows || []
         if (data.lastUpdated) {
@@ -128,7 +137,7 @@ Item {
         }
         root.limitingWindow = limitingId
 
-        if (isOffline) {
+        if (unreadable) {
             root.status = _quietUntilReset() ? "sleeping" : "offline"
         } else if (maxUtil >= 0) {
             root.status = TimeUtils.getStatus(maxUtil, root.warningThreshold, root.criticalThreshold)
