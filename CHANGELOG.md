@@ -8,6 +8,20 @@ from `metadata.json`, and pushing a `v*` tag builds and attaches the
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-29
+
+**A bug-fix release.** A top-to-bottom audit of the widget and the collector
+found a set of failures that no test drove — the suite was green throughout.
+The worst reported the wrong severity for any usage data more than fifteen
+minutes old, so a five-hour window sitting at 99% drew a blue bar and read
+"Waiting for a limit to reset". The rest were a badge that could be filed under
+the wrong account, a configuration path that was ignored on first open, and
+three that only ever affect CI.
+
+Upgrading needs nothing. There are no schema, file-format or configuration
+changes: the collector keeps writing the same `usage.json`, and an install with
+no `accounts.json` still resolves to the single `~/.claude` account.
+
 ### Documentation
 
 The 30-second refresh floor was documented as a defence against the usage
@@ -24,7 +38,9 @@ defending against, and they stay in step by hand.
 
 A top-to-bottom audit found a lot of these, and a few of them are severe enough
 to lead with. The test suite was fully green throughout: the failures below were
-in paths no test drove.
+in paths no test drove, which is why several of them are that severe. Each is
+pinned now; where a fix needed a test to be written from a direction it had
+not been written from, that is said below.
 
 **Stale data was reported with the wrong severity.** `UsageModel._applyUsage`
 took a second argument meaning "this file could not be read", and the caller
@@ -142,6 +158,15 @@ permanently disarming session priming — with nothing said.
   drifted. Nothing enforced `docs/i18n.md`'s extraction command, so a new
   user-facing string written as a bare literal passed every check in the
   repository and never reached a translator.
+- `UsageModel` has a test suite. It is the only component that decides how
+  urgent an account is, and nothing tested it — which is how the stale-data
+  failure below went unnoticed. It drives a real file read rather than
+  calling the internal function, because the bug was in the caller and a suite
+  that calls it with a literal passes with the bug still in place.
+- `ServiceControl` has hermetic CI coverage: the surface the other suites bind
+  to, and the paths that must refuse to spawn anything. It had none, which is
+  how it kept three raw data sources with neither the coalescing nor the
+  watchdog the rest of the widget has.
 
 ### Changed
 

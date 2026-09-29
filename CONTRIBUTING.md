@@ -51,14 +51,16 @@ export QT_QPA_PLATFORM=offscreen
 qmllint contents/ui/*.qml contents/code/*.qml contents/config/*.qml
 for t in tests/tst_timeutils.qml tests/tst_provider.qml tests/tst_refresh.qml \
          tests/tst_config.qml tests/tst_configaccounts.qml tests/tst_accounts.qml \
-         tests/tst_primer.qml; do
+         tests/tst_primer.qml tests/tst_model.qml tests/tst_serviceunit.qml; do
     qmltestrunner -input "$t"
 done
 ```
 
 `tests/tst_service.qml` is deliberately left out of CI: it drives a real systemd
 user manager and will stop and restart `kclaude.service` if you have it
-installed. Run it by hand when you touch `ServiceControl.qml`.
+installed. Run it by hand when you touch `ServiceControl.qml`; the parts of
+that component that need no session are covered by `tst_serviceunit.qml`,
+which is the one in CI.
 
 New logic wants one runnable check, not a suite. The daemon keeps its checks in
 `--selftest`; the QML suites need no network and no `~/.claude`, and the only
