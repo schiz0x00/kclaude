@@ -32,6 +32,10 @@ CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("
 # predates multiple accounts, which is why load_accounts falls back rather than
 # treating a missing file as "no accounts".
 ACCOUNTS_FILE = os.path.join(CONFIG_DIR, "accounts.json")
+# (mtime_ns, size) of ACCOUNTS_FILE as last read by reload_accounts, in a
+# one-slot box so the check stays cheap and the state is resettable when the
+# selftest repoints ACCOUNTS_FILE at a scratch path.
+ACCOUNTS_FILE_STAMP = [None]
 LOCK_FILE = os.path.join(STATE_DIR, "daemon.lock")
 DEFAULT_CONFIG_DIR = os.path.expanduser("~/.claude")
 # The first account's state files, unsuffixed, so an install that already has
@@ -1494,6 +1498,24 @@ def reload_accounts(accounts):
     every account's state files would strand the numbers the widget is reading.
     """
     state_dir = accounts[0].state_dir if accounts else None
+    # This runs on every pass of the poll loop, and when nothing has changed --
+    # which is almost always -- the work it used to do was thrown away:
+    # accounts_file_state() read and parsed the file, load_accounts() read and
+    # parsed it again, and constructing each Account ran ScopedWindows._load()
+    # into a further file per account. About ten reads a minute, every minute,
+    # to conclude nothing. One stat answers the same question.
+    #
+    # mtime *and* size, because a same-second rewrite with the same length is
+    # exactly the edit this would otherwise miss, and the cost of a false
+    # negative is one wasted reload rather than a stale account list.
+    try:
+        st = os.stat(ACCOUNTS_FILE)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if stamp is not None and accounts and stamp == ACCOUNTS_FILE_STAMP[0]:
+        return accounts
+    ACCOUNTS_FILE_STAMP[0] = stamp
     if accounts_file_state() == "unreadable":
         # Failing closed. The file is there and cannot be parsed, which is a
         # transient or damaged state -- not a decision to watch ~/.claude. The
@@ -2259,6 +2281,11 @@ def selftest():
         # what it says: the names, the isolation, and the reload.
         with tempfile.TemporaryDirectory() as d:
             ACCOUNTS_FILE = os.path.join(d, "accounts.json")
+            # Every case below rewrites this file, several within the same clock
+            # tick, so the mtime/size short-circuit reload_accounts() uses would
+            # legitimately decide the next reload is unnecessary. Reset it, or
+            # the cases after the first one test nothing.
+            ACCOUNTS_FILE_STAMP[0] = None
 
             # A missing file is what every pre-multi-account install looks like, and
             # it has to keep working rather than take the widget down.
@@ -2410,6 +2437,73 @@ def selftest():
             assert swapped[0].usage_file == os.path.join(d, "usage.json"), swapped[0].usage_file
             assert swapped[1].usage_file == os.path.join(d, "usage-a0.json"), swapped[1].usage_file
             assert swapped[0].scoped._path == swapped[0].scoped_file
+
+            # reload_accounts() runs on every pass of the poll loop and, before
+            # the stat, read and parsed accounts.json twice and then ran one
+            # more read per account to build a ScopedWindows that was then
+            # thrown away -- around ten reads a minute, for ever, to conclude
+            # nothing. A single stat now short-circuits that, and the short
+            # circuit must not be able to miss a real edit.
+            ACCOUNTS_FILE_STAMP[0] = None
+            current = load_accounts(d)
+            first = reload_accounts(current)
+            assert [a.id for a in first] == ["a1", "a0"]
+            # The short circuit has to be checked by what it stops doing, not
+            # by the list it returns: with the stat reverted this still hands
+            # back the same objects, because the signature comparison below
+            # finds nothing changed either. Counting the reads is the only
+            # thing that distinguishes the fix from the behaviour it replaced.
+            real_open = open
+            reads = []
+            def counting_open(file, *a, **kw):
+                if file == ACCOUNTS_FILE:
+                    reads.append(file)
+                return real_open(file, *a, **kw)
+            globals()["open"] = counting_open
+            try:
+                again = reload_accounts(first)
+            finally:
+                globals()["open"] = real_open
+            assert not reads, "an unchanged accounts.json must not be read at all"
+            again = reload_accounts(first)
+            assert [a.id for a in again] == ["a1", "a0"]
+            # A real edit is still noticed. Written immediately, so if only
+            # mtime were checked this would depend on the clock having ticked;
+            # the size differs too, so the edit is found either way.
+            write_atomic(ACCOUNTS_FILE, json.dumps({"accounts": [
+                {"id": "a1", "path": os.path.join(d, "c1")},
+                {"id": "a0", "path": os.path.join(d, "c0")},
+                {"id": "a2", "path": os.path.join(d, "c2")},
+            ]}))
+            grown = reload_accounts(again)
+            assert [a.id for a in grown] == ["a1", "a0", "a2"], [a.id for a in grown]
+            # And a same-length rewrite, which is the case a size-only check
+            # would miss: the file is rewritten in place with different contents
+            # of exactly the same length.
+            same = json.dumps({"accounts": [
+                {"id": "z1", "path": os.path.join(d, "c1")},
+                {"id": "z0", "path": os.path.join(d, "c0")},
+            ]})
+            other = json.dumps({"accounts": [
+                {"id": "y1", "path": os.path.join(d, "c1")},
+                {"id": "y0", "path": os.path.join(d, "c0")},
+            ]})
+            assert len(same) == len(other)
+            write_atomic(ACCOUNTS_FILE, same)
+            primed = reload_accounts(grown)
+            assert [a.id for a in primed] == ["z1", "z0"], [a.id for a in primed]
+            st_before = os.stat(ACCOUNTS_FILE)
+            write_atomic(ACCOUNTS_FILE, other)
+            # Note what is deliberately *not* asserted here: a rewrite that
+            # leaves both mtime and size identical is undetectable by any
+            # stat-based check, and write_atomic renames a fresh temp file over
+            # the old one, so the mtime moves on its own. The cost of being
+            # wrong in that one remaining case is a reload the user triggers
+            # again, not a stale account list.
+            assert os.stat(ACCOUNTS_FILE).st_mtime_ns != st_before.st_mtime_ns, \
+                "an atomic rewrite must not preserve the mtime"
+            relabelled = reload_accounts(primed)
+            assert [a.id for a in relabelled] == ["y1", "y0"], [a.id for a in relabelled]
 
         # Pro accounts cannot have a per-model weekly budget, so the scarce endpoint
         # call is not worth making for them -- and a downgrade must take the window
