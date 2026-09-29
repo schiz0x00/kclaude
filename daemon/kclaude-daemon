@@ -127,9 +127,18 @@ FIVE_HOURS = 5 * 3600
 # Wake just after the reset, not exactly on it: clocks disagree by seconds and
 # an early ping just earns another refusal.
 RESET_SLACK = 10
-# A held-down Refresh button must not turn into an API hammer. The usage
-# endpoint returns 429 well below one call every 30s, so this is the floor for
-# manually requested polls, not a nicety.
+# A held-down Refresh button must not turn into a hammer. This is the floor a
+# manual poll is let through at, and the floor every schedule is clamped to, so
+# no arithmetic upstream can turn "a window is spent" into a faster poll than
+# this daemon is willing to make.
+#
+# It was justified by the usage endpoint returning 429 well below one call
+# every 30s, back when a poll *was* a call to that endpoint. A poll is a
+# /v1/messages ping now, which is not scarce, so the endpoint argument no
+# longer applies to this number -- but the floor still does, because a ping
+# costs something real (it spends tokens, and it opens a five-hour window if
+# none is running) and because the widget mirrors this value as its own
+# refresh cooldown, so the two have to stay in step by hand.
 MIN_POLL_GAP = 30
 # Fable's weekly budget is the one limit the ping cannot see (see ScopedWindows),
 # so it costs a usage-endpoint call -- the scarce endpoint this daemon otherwise
@@ -1438,7 +1447,10 @@ def request_poll(accounts):
     The floor is the account's own wake_floor, not zero: a refresh must not
     become a way around the pacing a 429 or a spent limit is enforcing, and
     during an error backoff that floor is the whole backoff, so no signal can
-    short-circuit it.
+    short-circuit it. A ping refused for quota is data rather than an error (see
+    ping_usage), so the backoff this has to respect comes from the generic
+    error path: a refused *scoped* fetch, a transport error, a protocol
+    surprise. A held-down Refresh must not walk straight into any of those.
     """
     for account in accounts:
         account.next_due = min(account.next_due, account.last_poll + account.wake_floor)

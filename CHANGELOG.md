@@ -8,6 +8,18 @@ from `metadata.json`, and pushing a `v*` tag builds and attaches the
 
 ## [Unreleased]
 
+### Documentation
+
+The 30-second refresh floor was documented as a defence against the usage
+endpoint's rate limit, in the widget, the collector, `README.md` and
+`docs/architecture.md`. A poll has been a `/v1/messages` ping rather than an
+endpoint call since the Fable work, and that endpoint is now reached only for
+the weekly scoped budget on its own half-hourly interval, so the reasoning
+described a request the collector no longer makes. The floor itself is
+unchanged and still correct — a ping spends tokens and can open a five-hour
+window — but it is a floor the two sides share rather than a rate they are
+defending against, and they stay in step by hand.
+
 ### Fixed
 
 A top-to-bottom audit found a lot of these, and a few of them are severe enough

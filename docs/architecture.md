@@ -409,8 +409,9 @@ independent — separate tokens, separate rate-limit budgets, separate resets.
 
 `wake_floor` stays per account for the reason it existed at all: a Refresh click
 may bring an account forward to `last_poll + wake_floor` but no further, so a
-signal cannot short-circuit a 429 or a spent limit. During an error backoff that
-floor *is* the backoff, which is what stops one 429 becoming a hammer.
+signal cannot short-circuit a spent limit or an error backoff. During a backoff
+that floor *is* the backoff, which is what stops a held-down button turning one
+failure into a hammer.
 
 One consequence worth stating: adding an account is noticed on the next loop
 iteration, which is the poll cadence. So a new account starts polling within

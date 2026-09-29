@@ -424,8 +424,9 @@ systemctl --user kill -s USR1 kclaude.service
 ```
 
 Manually requested polls are floored at 30s apart, and a refresh request will not
-short-circuit an error backoff. The usage endpoint returns `429 Too Many Requests`
-well below one call every 30s, so both limits matter.
+short-circuit an error backoff. Both limits matter: a poll is a real request
+that spends tokens and can open a five-hour window, so a held-down button is
+not a way round the collector's pacing.
 
 `SIGUSR2` is the other half: send one message to open a new five-hour window.
 This is the only thing the daemon does that spends usage, it is floored at one

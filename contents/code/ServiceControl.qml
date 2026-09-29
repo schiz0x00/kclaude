@@ -22,7 +22,17 @@ Item {
 
     // systemctl is not free, and onExpandedChanged can fire repeatedly.
     readonly property int startCooldownMs: 15000
-    // Matches the daemon's MIN_POLL_GAP: the endpoint 429s faster than this.
+    // Matches the daemon's MIN_POLL_GAP, which is the floor it will let a
+    // manual poll through at, so a held-down Refresh cannot become a way round
+    // its pacing.
+    //
+    // This said the endpoint 429s below this, which was true when a poll *was*
+    // a call to the usage endpoint. It is not one any more: the poll is a
+    // /v1/messages ping, and the scarce endpoint is only reached now for the
+    // Fable weekly budget, on its own half-hourly interval. The number is
+    // still the right one and is still enforced independently on the daemon
+    // side -- but it is a floor this widget shares, not a rate it is defending
+    // against, and the two are only in step by hand.
     readonly property int pollCooldownMs: 30000
     property double _lastStartMs: 0
     property double _lastPollMs: 0
