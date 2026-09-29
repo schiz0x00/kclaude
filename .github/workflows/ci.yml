@@ -20,10 +20,94 @@ jobs:
         run: node tests/accounts.test.js
       - name: Package layout and config wiring
         run: node tests/package-layout.test.js
-      - name: Daemon selftest
-        run: python3 daemon/kclaude-daemon --selftest
       - name: Shellcheck install scripts
         run: shellcheck scripts/*.sh
+
+  # The collector declares only "python3" in packaging/nfpm.yaml and README, so
+  # the selftest has to pass on the oldest interpreter anyone is likely to be
+  # running. It did not, for a long time, and nothing noticed: the daemon's own
+  # iso() writes a trailing "Z" and datetime.fromisoformat only learned to read
+  # one in 3.11, so on 3.9/3.10 every reset time failed to parse -- silently,
+  # because the failure is swallowed into a one-hour fallback, which quietly
+  # degraded the entire go-quiet-until-reset design.
+  daemon:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Daemon selftest
+        run: python3 daemon/kclaude-daemon --selftest
+
+  # A lint pass over the one Python file in the project. Ruff needs no config
+  # and no dependencies in this repo, which is the point: the daemon is
+  # stdlib-only and its test command has to stay that simple.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ruff
+        run: |
+          pip install ruff
+          # The daemon has no .py extension, so it is linted through stdin with
+          # an explicit filename rather than by path.
+          ruff check --stdin-filename daemon/kclaude-daemon.py - < daemon/kclaude-daemon
+
+  # Nothing enforces docs/i18n.md's extraction command, so a new user-facing
+  # string written as a bare literal in one of the plasmashell-only files passes
+  # every check in this repository and simply never reaches a translator.
+  # Regenerating the template and diffing it catches that.
+  #
+  # Fails on drift only. With no template committed yet it uploads the freshly
+  # generated one as an artifact and says so, rather than failing the first run
+  # of a repository that has never shipped translations.
+  i18n:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gettext
+        run: sudo apt-get update && sudo apt-get install -y gettext
+      - name: Regenerate the template with the command in docs/i18n.md
+        run: |
+          xgettext --from-code=UTF-8 -L JavaScript \
+              -ki18n:1 -ki18nc:1c,2 -ki18np:1,2 -ki18ncp:1c,2,3 \
+              -k_tr:1 -k_trp:1,2 \
+              -o kclaude.generated.pot \
+              contents/ui/*.qml contents/code/*.qml contents/code/*.js
+      - name: Compare against the committed template
+        run: |
+          POT=plasma_applet_io.github.schiz0x00.kclaude.pot
+          if [ ! -f "$POT" ]; then
+            echo "::notice::No $POT committed yet. The generated one is attached to this run;"
+            echo "::notice::commit it to start enforcing the template."
+            exit 0
+          fi
+          # Strip the translator comments *and* POT-Creation-Date. The date is a
+          # header string ("POT-Creation-Date: ...\n"), not a '#' comment, so
+          # `grep -v '^#'` does not remove it -- and xgettext writes the current
+          # time on every run, so without this the diff fails on every run and
+          # the job goes permanently red the moment a .pot is committed.
+          strip() { grep -v '^#' "$1" | grep -v '^"POT-Creation-Date:'; }
+          if ! diff -u <(strip "$POT") <(strip kclaude.generated.pot); then
+            echo "::error::The committed translation template is stale. Run the xgettext"
+            echo "::error::command from docs/i18n.md and commit the result."
+            exit 1
+          fi
+      - name: Upload the generated template
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kclaude-pot
+          path: kclaude.generated.pot
+          if-no-files-found: warn
 
   qml:
     runs-on: ubuntu-latest
@@ -44,8 +128,10 @@ jobs:
           export QT_QPA_PLATFORM=offscreen
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_timeutils.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_provider.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_model.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_refresh.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_config.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_configaccounts.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_accounts.qml
           /usr/lib/qt6/bin/qmltestrunner -input tests/tst_primer.qml
+          /usr/lib/qt6/bin/qmltestrunner -input tests/tst_serviceunit.qml

@@ -12,8 +12,13 @@
 // Nothing here runs systemctl. Two components of ServiceControl *would* -- a
 // start and a poll poke -- and those cases live in tst_service.qml, where
 // starting the unit is expected and the isolation is real. What is left here is
-// everything decidable without a session: the surface, the parsing, and the
-// paths that must refuse to run anything at all.
+// everything decidable without a session: the surface other suites bind to, and
+// the paths that must refuse to run anything at all.
+//
+// Deliberately *not* a second copy of the state-parsing table that
+// tst_service.qml already carries. It was, and nine of its ten cases were
+// byte-identical to the ones there: a duplicate table is a second thing to
+// update, and it keeps passing after the component changes underneath it.
 import QtQuick
 import QtTest
 import "../contents/code" as CodeModule
@@ -43,44 +48,36 @@ TestCase {
         compare(typeof service._applyState, "function", "_applyState()")
     }
 
-    // systemctl's output is untrusted text in a fixed format. Order of the two
-    // properties must not matter, an unknown ActiveState is "inactive" rather
-    // than a guess, and anything unrecognised is "unknown" rather than a lie.
-    function test_01_parses_systemd_state() {
-        var cases = [
-            ["LoadState=loaded\nActiveState=active\n", "active"],
-            ["LoadState=loaded\nActiveState=inactive\n", "inactive"],
-            ["LoadState=loaded\nActiveState=activating\n", "starting"],
-            ["LoadState=loaded\nActiveState=failed\n", "failed"],
-            ["LoadState=loaded\nActiveState=deactivating\n", "inactive"],
-            ["LoadState=loaded\nActiveState=reloading\n", "active"],
-            ["LoadState=not-found\nActiveState=inactive\n", "notinstalled"],
-            ["LoadState=masked\nActiveState=inactive\n", "notinstalled"],
-            ["", "unknown"],
-            ["garbage output", "unknown"],
-            ["ActiveState=active\nLoadState=loaded\n", "active"]
-        ]
-        for (var i = 0; i < cases.length; i++) {
-            service.serviceState = "unknown"
-            service._applyState(cases[i][0])
-            compare(service.serviceState, cases[i][1], "for " + JSON.stringify(cases[i][0]))
-        }
-    }
+    // systemctl's output parsing is *not* repeated here. tst_service.qml
+    // already carries the table, and a second copy of it is a second place for
+    // the two to disagree about what a state means -- and for one of them to
+    // keep passing after the component changes. What belongs in this suite is
+    // what tst_service.qml cannot check without a systemd session.
 
     // systemctl is not free, and onExpandedChanged can fire repeatedly. The
-    // cooldown itself is asserted in tst_service.qml, because asserting it means
-    // letting start() run.
+    // cooldown itself is asserted in tst_service.qml, because asserting it
+    // means letting start() run, which needs a session.
 
-    // Starting or even asking systemctl about a unit that is not installed is
-    // not this widget's call: installing the collector reads the user's
+    // Asking systemctl about, or signalling, a unit that is not running is not
+    // this widget's call: installing the collector reads the user's
     // credentials, and that stays an explicit install.sh decision. Both of
     // these must return before a process is spawned, which is what makes them
     // safe to run anywhere.
-    function test_02_nothing_is_run_for_a_missing_unit() {
+    function test_01_nothing_is_run_for_a_missing_or_stopped_unit() {
         service._applyState("LoadState=not-found\nActiveState=inactive\n")
         compare(service.start(), false, "must not run systemctl for a missing unit")
         // A prime without a running collector cannot be delivered anyway --
         // only the collector holds the token -- so it must not claim success.
+        // tst_service.qml does not cover requestPrime() at all, so this is the
+        // one path here that is not already asserted elsewhere.
+        compare(service.requestPrime(), false, "a prime needs an active unit")
+
+        // Loaded but stopped: still not something to poke. requestPoll() falls
+        // through to start(), which the cooldown governs, so it must not have
+        // signalled anything here.
+        service.serviceState = "inactive"
+        compare(service.requestPoll(), true, "an inactive unit is started, not signalled")
+        // ...and a prime against that same state is still refused.
         compare(service.requestPrime(), false, "a prime needs an active unit")
     }
 }
