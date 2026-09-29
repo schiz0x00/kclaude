@@ -14,6 +14,40 @@ A top-to-bottom audit found a lot of these, and a few of them are severe enough
 to lead with. The test suite was fully green throughout: the failures below were
 in paths no test drove.
 
+**Stale data was reported with the wrong severity.** `UsageModel._applyUsage`
+took a second argument meaning "this file could not be read", and the caller
+passed `_provider.isStale` — "this file is old" — to it. Every file the
+collector had stopped updating therefore took the unreadable branch,
+`TimeUtils.getStatus()` was never called, and the status came out as `sleeping`
+or `offline` regardless of the numbers: a **stale 99%** drew a blue bar and read
+"Waiting for a limit to reset". Staleness is still reported, through the
+"Usage data is stale" note and the "N minutes ago" line; it just no longer
+decides severity. `UsageModel` had no test suite of its own, which is how this
+survived — it is the only component that decides severity. `tests/tst_model.qml`
+now covers it, driving a real file read rather than calling `_applyUsage()`
+directly, because a suite that calls it with a literal passes with the bug
+still in place.
+
+**A badge could be filed under the wrong account.** The accounts page reads one
+usage file per account in sequence to show plan badges, recording which row the
+read in flight belongs to. Editing the list restarted the sweep while a read
+was still in flight, resetting that row marker and the position counter
+underneath it, so the straggling result was stored against whichever account
+had taken its place. A generation counter now drops results from a superseded
+sweep.
+
+**Badges read "unknown" for a customized usage path.** Plasma assigns the
+General page's `cfg_*` values around construction, and the badge sweep read the
+base path once, when the account list landed. A path assigned after that was
+never used, so every badge was answered from the default directory until the
+dialog was reopened — for exactly the user the setting exists for.
+
+**Ten file reads a minute to discover nothing.** The collector re-read
+`accounts.json` on every pass of the poll loop: once to classify it, once more
+to load it, and once more per account building a scoped-limits cache that was
+then discarded because nothing had changed. A single `stat` now short-circuits
+the common case.
+
 **The Accounts settings page could destroy your account list.** The page
 instantiated its `AccountList` with no `Component.onCompleted: refresh()`, so
 the read was never started, the working copy stayed empty, and pressing OK
